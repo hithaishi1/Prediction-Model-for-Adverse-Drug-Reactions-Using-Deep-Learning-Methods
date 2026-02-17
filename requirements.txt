@@ -1,12 +1,30 @@
+# Core dependencies
 numpy
 pandas
 scikit-learn
-xgboost
-lightgbm
-imbalanced-learn
 matplotlib
 seaborn
 jupyter
 ipykernel
+
+# Machine Learning
+xgboost
+lightgbm
+imbalanced-learn
+
+# Deep Learning
 tensorflow
+torch
+torchvision
+torchaudio
+
+# Model interpretability
 shap
+
+# Progress bars and utilities
+tqdm
+
+# Deployment (optional - uncomment if needed)
+# streamlit
+# fastapi
+# uvicorn
