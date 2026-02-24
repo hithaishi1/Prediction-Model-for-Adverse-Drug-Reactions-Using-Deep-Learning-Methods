@@ -1,0 +1,13 @@
+drug_encoded
+gender_encoded
+anchor_age
+age_group_encoded
+dose_val_rx
+log_dose
+dose_unit_rx_encoded
+route_encoded
+treatment_duration_hours
+drug_frequency
+patient_admission_count
+patient_prescription_count
+risk_score
