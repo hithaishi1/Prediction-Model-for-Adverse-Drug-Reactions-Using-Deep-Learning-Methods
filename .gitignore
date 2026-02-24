@@ -9,6 +9,14 @@ processed_data/
 *.csv
 *.parquet
 
+# Model artifacts
+models/
+*.pth
+*.pt
+*.pkl
+*.joblib
+*.json
+
 # Python cache
 __pycache__/
 *.pyc
