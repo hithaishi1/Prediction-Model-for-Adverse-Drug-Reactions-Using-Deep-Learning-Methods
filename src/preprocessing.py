@@ -9,6 +9,7 @@ pd.set_option("display.max_columns", 50)
 pd.set_option("display.width", 120)
 
 # Configuration
+# Resolve all paths relative to repository root so this script works on any machine.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data" / "hosp"
 OUTPUT_DIR = PROJECT_ROOT / "processed_data"
@@ -27,6 +28,7 @@ required_inputs = [
 ]
 missing_inputs = [str(path) for path in required_inputs if not path.exists()]
 if missing_inputs:
+    # Fail early with explicit missing paths instead of raising during read_csv.
     raise FileNotFoundError(
         "Missing required input files:\n- " + "\n- ".join(missing_inputs)
     )
@@ -36,6 +38,7 @@ if missing_inputs:
 # ============================================================================
 print("\n[1/8] Loading data...")
 
+# Load only columns needed for downstream features to reduce memory use.
 patients = pd.read_csv(DATA_DIR / "patients.csv.gz")
 prescriptions = pd.read_csv(
     DATA_DIR / "prescriptions.csv.gz",
@@ -59,6 +62,7 @@ print(f"ADR Labels: {adr_labels.shape}")
 print("\n[2/8] Merging datasets...")
 
 # Merge prescriptions with patient demographics
+# Left join keeps all prescription rows while adding demographics when available.
 data = prescriptions.merge(
     patients[["subject_id", "gender", "anchor_age"]],
     on="subject_id",
@@ -66,6 +70,7 @@ data = prescriptions.merge(
 )
 
 # Merge with ADR labels
+# Inner join restricts rows to medication events that were labeled in notebook step.
 data = data.merge(
     adr_labels,
     on=["subject_id", "hadm_id", "drug"],
@@ -88,6 +93,7 @@ print("\nConverting dose_val_rx to numeric...")
 data["dose_val_rx"] = pd.to_numeric(data["dose_val_rx"], errors='coerce')
 
 # Fill missing doses with median by drug
+# Drug-level median preserves medication-specific dosing scale when possible.
 data["dose_val_rx"] = data.groupby("drug")["dose_val_rx"].transform(
     lambda x: x.fillna(x.median()) if x.notna().any() else x.fillna(0)
 )
@@ -100,14 +106,17 @@ else:
     data["dose_val_rx"] = data["dose_val_rx"].fillna(0)
 
 # Fill missing dose units and routes with 'Unknown'
+# Preserve row count while making categorical NaNs explicit for encoding.
 data["dose_unit_rx"] = data["dose_unit_rx"].fillna("Unknown")
 data["route"] = data["route"].fillna("Unknown")
 
 # Handle time columns
+# Coercing errors guards against malformed timestamps in raw tables.
 data["starttime"] = pd.to_datetime(data["starttime"], errors='coerce')
 data["stoptime"] = pd.to_datetime(data["stoptime"], errors='coerce')
 
 # Calculate treatment duration
+# Duration becomes a direct exposure-intensity feature for the classifier.
 data["treatment_duration_hours"] = (
     (data["stoptime"] - data["starttime"]).dt.total_seconds() / 3600
 )
@@ -124,6 +133,7 @@ print(data.isnull().sum())
 print("\n[4/8] Engineering features...")
 
 # Age groups
+# Bucket age into coarse bins for non-linear age-risk relationships.
 data["age_group"] = pd.cut(
     data["anchor_age"],
     bins=[0, 30, 50, 65, 100],
@@ -131,13 +141,16 @@ data["age_group"] = pd.cut(
 )
 
 # Dose features
+# Log transform reduces skew from very large dose values.
 data["log_dose"] = np.log1p(data["dose_val_rx"])
 
 # Drug frequency (how common is this drug)
+# This approximates population-level exposure prevalence.
 drug_freq = data["drug"].value_counts()
 data["drug_frequency"] = data["drug"].map(drug_freq)
 
 # Patient history features (number of admissions and prescriptions)
+# Encounter and prescription counts approximate comorbidity/complexity.
 patient_admissions = data.groupby("subject_id")["hadm_id"].nunique()
 data["patient_admission_count"] = data["subject_id"].map(patient_admissions)
 
@@ -145,6 +158,7 @@ patient_prescriptions = data.groupby("subject_id").size()
 data["patient_prescription_count"] = data["subject_id"].map(patient_prescriptions)
 
 # Risk score based on age and prescription count
+# Simple hand-crafted risk prior used as an additional model input.
 data["risk_score"] = (
     data["anchor_age"] / 100 + 
     np.log1p(data["patient_prescription_count"]) / 10
@@ -158,6 +172,7 @@ print(f"\nFeatures created. New shape: {data.shape}")
 print("\n[5/8] Encoding categorical variables...")
 
 # Initialize encoders
+# Persisting these encoders enables consistent inference preprocessing later.
 label_encoders = {}
 
 categorical_cols = ["drug", "gender", "dose_unit_rx", "route", "age_group"]
@@ -174,6 +189,7 @@ for col in categorical_cols:
 print("\n[6/8] Preparing features and target...")
 
 # Select features for modeling
+# Mix encoded categoricals with scaled numeric clinical context variables.
 feature_cols = [
     "drug_encoded",
     "gender_encoded",
@@ -230,6 +246,7 @@ print("Numerical features scaled using StandardScaler")
 print("\n[8/8] Splitting data into train/val/test sets...")
 
 # First split: separate test set (20%)
+# Stratification preserves ADR prevalence across all splits.
 X_temp, X_test, y_temp, y_test = train_test_split(
     X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
 )
@@ -260,6 +277,7 @@ y_val.to_csv(OUTPUT_DIR / "y_val.csv", index=False)
 y_test.to_csv(OUTPUT_DIR / "y_test.csv", index=False)
 
 # Save preprocessors
+# These artifacts are required to reproduce train-time transforms.
 with open(OUTPUT_DIR / "label_encoders.pkl", "wb") as f:
     pickle.dump(label_encoders, f)
 
@@ -271,6 +289,7 @@ with open(OUTPUT_DIR / "feature_names.txt", "w") as f:
     f.write("\n".join(feature_cols))
 
 # Save full processed dataset for reference
+# Useful for audit/debugging feature values outside model scripts.
 data.to_csv(OUTPUT_DIR / "full_processed_data.csv", index=False)
 
 print(f"\nAll data saved to {OUTPUT_DIR}/")

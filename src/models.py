@@ -14,7 +14,8 @@ class MLPClassifier(nn.Module):
     """
     def __init__(self, input_dim, hidden_dims=[256, 128, 64, 32], dropout_rate=0.3):
         super(MLPClassifier, self).__init__()
-        
+        # Build an interleaved stack of Linear -> BN -> ReLU -> Dropout blocks.
+        # Using a loop keeps hidden layer depth configurable from one argument.
         layers = []
         prev_dim = input_dim
         
@@ -31,6 +32,7 @@ class MLPClassifier(nn.Module):
         self.network = nn.Sequential(*layers)
     
     def forward(self, x):
+        # Returns raw logits; sigmoid is applied in loss/metric code.
         return self.network(x)
 
 
@@ -48,8 +50,7 @@ class EmbeddingMLP(nn.Module):
                  hidden_dims=[256, 128, 64],
                  dropout_rate=0.3):
         super(EmbeddingMLP, self).__init__()
-        
-        # Embedding layers
+        # Embedding layers compress sparse categorical IDs into dense vectors.
         self.drug_embedding = nn.Embedding(num_drugs, embedding_dim)
         self.route_embedding = nn.Embedding(num_routes, min(50, num_routes // 2))
         self.dose_unit_embedding = nn.Embedding(num_dose_units, min(50, num_dose_units // 2))
@@ -74,7 +75,7 @@ class EmbeddingMLP(nn.Module):
         self.network = nn.Sequential(*layers)
     
     def forward(self, drug_idx, route_idx, dose_unit_idx, numerical_features):
-        # Get embeddings
+        # Map integer category IDs to dense trainable vectors.
         drug_emb = self.drug_embedding(drug_idx)
         route_emb = self.route_embedding(route_idx)
         dose_unit_emb = self.dose_unit_embedding(dose_unit_idx)
@@ -96,6 +97,7 @@ class ResidualBlock(nn.Module):
         self.dropout = nn.Dropout(dropout_rate)
     
     def forward(self, x):
+        # Preserve the original input so the block learns only the residual.
         residual = x
         out = F.relu(self.bn1(self.fc1(x)))
         out = self.dropout(out)
@@ -131,6 +133,7 @@ class ResNetClassifier(nn.Module):
         self.output_layer = nn.Linear(hidden_dim, 1)
     
     def forward(self, x):
+        # Project to hidden size once, then refine through residual blocks.
         x = self.input_layer(x)
         
         for block in self.blocks:
@@ -150,13 +153,14 @@ class AttentionLayer(nn.Module):
     
     def forward(self, x):
         # x shape: (batch_size, dim)
-        # Add sequence dimension
+        # Add a synthetic sequence dimension so attention math can be reused.
         x = x.unsqueeze(1)  # (batch_size, 1, dim)
         
         Q = self.query(x)
         K = self.key(x)
         V = self.value(x)
         
+        # Scaled dot-product attention weights.
         attention_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
         attention_weights = F.softmax(attention_scores, dim=-1)
         
@@ -199,6 +203,8 @@ class AttentionClassifier(nn.Module):
         self.mlp = nn.Sequential(*layers)
     
     def forward(self, x):
+        # Attention returns both transformed features and weights; only features
+        # are used for classification in this baseline.
         x = self.input_projection(x)
         x, attention_weights = self.attention(x)
         return self.mlp(x)
@@ -219,6 +225,7 @@ class DeepEnsemble(nn.Module):
             self.weights = torch.tensor(weights)
     
     def forward(self, x):
+        # Forward each sub-model independently, then blend their logits.
         predictions = []
         for model in self.models:
             predictions.append(model(x))
@@ -242,6 +249,8 @@ def get_model(model_type, **kwargs):
     Returns:
         PyTorch model
     """
+    # Keep model creation logic centralized so training/evaluation scripts
+    # can switch architectures from a simple config dict.
     if model_type == 'mlp':
         return MLPClassifier(**kwargs)
     elif model_type == 'embedding':
@@ -266,6 +275,8 @@ class FocalLoss(nn.Module):
         self.gamma = gamma
     
     def forward(self, inputs, targets):
+        # BCE with logits is the base loss; focal weighting down-weights
+        # "easy" examples so learning focuses on hard, minority-class cases.
         BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
         pt = torch.exp(-BCE_loss)
         F_loss = self.alpha * (1 - pt) ** self.gamma * BCE_loss

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 # Add parent directory to path for imports
+# Allows running this file directly (`python src/train.py`) without package install.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import torch
@@ -33,6 +34,7 @@ except ImportError:
 class ADRDataset(Dataset):
     """PyTorch Dataset for ADR prediction"""
     def __init__(self, X, y):
+        # Accept either pandas objects or numpy arrays and normalize to tensors.
         self.X = torch.FloatTensor(X.values if hasattr(X, 'values') else X)
         # Ensure y is 1D, then add dimension for BCE loss
         y_array = y.values if hasattr(y, 'values') else y
@@ -57,6 +59,7 @@ class EarlyStopping:
         self.best_model_state = None
     
     def __call__(self, score, model):
+        # Snapshot best model state whenever monitored metric improves.
         if self.best_score is None:
             self.best_score = score
             self.best_model_state = model.state_dict().copy()
@@ -96,6 +99,7 @@ class Trainer:
         self.device = device
         
         # Loss function
+        # Focal loss is default because ADR labels are often imbalanced.
         if loss_type == 'focal':
             self.criterion = FocalLoss(alpha=0.25, gamma=2.0)
         elif loss_type == 'bce':
@@ -108,9 +112,11 @@ class Trainer:
             raise ValueError(f"Unknown loss type: {loss_type}")
         
         # Optimizer
+        # Adam is a stable default for tabular neural nets with mixed feature scales.
         self.optimizer = optim.Adam(model.parameters(), lr=learning_rate)
         
         # Learning rate scheduler
+        # Reduce LR when validation AUROC plateaus to stabilize late training.
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='max', factor=0.5, patience=5, verbose=True
         )
@@ -144,6 +150,7 @@ class Trainer:
             self.optimizer.step()
             
             # Track metrics
+            # Keep probability-space predictions so AUROC/AUPRC are threshold-free.
             total_loss += loss.item()
             all_preds.extend(torch.sigmoid(outputs).detach().cpu().numpy())
             all_targets.extend(y_batch.cpu().numpy())
@@ -202,6 +209,7 @@ class Trainer:
             val_loss, val_auroc, val_auprc = self.validate(val_loader)
             
             # Update learning rate
+            # Scheduler monitors validation AUROC, not loss, to align with objective.
             self.scheduler.step(val_auroc)
             
             # Store history
@@ -223,10 +231,21 @@ class Trainer:
                 break
         
         # Load best model
+        # Restore highest-val-AUROC checkpoint before returning.
         early_stopping.load_best_model(self.model)
         print(f"\nBest validation AUROC: {early_stopping.best_score:.4f}")
         
         return self.history
+
+    def set_learning_rate(self, learning_rate):
+        """Update optimizer learning rate and reset scheduler for a new training phase"""
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = learning_rate
+
+        # Reset scheduler state so fine-tuning has its own plateau tracking window.
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='max', factor=0.5, patience=5, verbose=True
+        )
     
     def predict(self, test_loader):
         """Generate predictions"""
@@ -245,6 +264,7 @@ class Trainer:
     
     def save_model(self, filepath):
         """Save model and training history"""
+        # Save both optimizer + history so training can be resumed/analyzed.
         torch.save({
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
@@ -265,6 +285,7 @@ def main():
     """Main training pipeline"""
     
     # Configuration
+    # Paths are repo-relative for portability between local environments.
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
     DATA_DIR = PROJECT_ROOT / "processed_data"
     MODELS_DIR = PROJECT_ROOT / "models"
@@ -272,17 +293,22 @@ def main():
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     
     # Hyperparameters
+    # These are conservative defaults; tune by validation AUROC/AUPRC.
     BATCH_SIZE = 1024
     LEARNING_RATE = 0.001
     EPOCHS = 50
     EARLY_STOPPING_PATIENCE = 10
+    ENABLE_FINE_TUNING = True
+    FINE_TUNE_LR_FACTOR = 0.1
+    FINE_TUNE_EPOCHS = 15
+    FINE_TUNE_PATIENCE = 5
     
     print("="*80)
     print("ADR Prediction Model Training")
     print("="*80)
     
     # Load data
-    print("\n[1/5] Loading preprocessed data...")
+    print("\n[1/6] Loading preprocessed data...")
     required_inputs = [
         DATA_DIR / "X_train.csv",
         DATA_DIR / "y_train.csv",
@@ -305,7 +331,7 @@ def main():
     print(f"ADR rate - Train: {y_train.mean().values[0]:.3f}, Val: {y_val.mean().values[0]:.3f}")
     
     # Create datasets
-    print("\n[2/5] Creating PyTorch datasets...")
+    print("\n[2/6] Creating PyTorch datasets...")
     train_dataset = ADRDataset(X_train, y_train)
     val_dataset = ADRDataset(X_val, y_val)
     
@@ -313,6 +339,7 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
     
     # Calculate class weights
+    # Computed for reference and optional BCE weighting if needed.
     y_train_flat = y_train.values.flatten() if hasattr(y_train, 'values') else y_train.flatten()
     unique, counts = np.unique(y_train_flat, return_counts=True)
     class_counts = dict(zip(unique, counts))
@@ -320,6 +347,7 @@ def main():
     print(f"Class weights: {class_weights}")
     
     # Train different models
+    # All models consume the same tabular feature matrix for fair comparison.
     models_config = {
         'mlp': {
             'model_type': 'mlp',
@@ -346,14 +374,16 @@ def main():
     
     for model_name, config in models_config.items():
         print(f"\n{'='*80}")
-        print(f"[3/5] Training {model_name.upper()} model...")
+        print(f"[3/6] Training {model_name.upper()} model...")
         print(f"{'='*80}")
         
         # Create model
+        # Factory function keeps architecture selection declarative.
         model_type = config.pop('model_type')
         model = get_model(model_type, **config)
         
         # Create trainer
+        # Using focal loss here; class_weights currently not passed.
         trainer = Trainer(
             model, 
             learning_rate=LEARNING_RATE,
@@ -368,6 +398,18 @@ def main():
             epochs=EPOCHS,
             early_stopping_patience=EARLY_STOPPING_PATIENCE
         )
+
+        # Optional second-phase fine-tuning at lower learning rate.
+        if ENABLE_FINE_TUNING:
+            fine_tune_lr = LEARNING_RATE * FINE_TUNE_LR_FACTOR
+            print(f"\n[4/6] Fine-tuning {model_name.upper()} at lr={fine_tune_lr}...")
+            trainer.set_learning_rate(fine_tune_lr)
+            history = trainer.fit(
+                train_loader,
+                val_loader,
+                epochs=FINE_TUNE_EPOCHS,
+                early_stopping_patience=FINE_TUNE_PATIENCE
+            )
         
         # Save model
         model_path = MODELS_DIR / f"{model_name}_best.pth"
@@ -381,12 +423,13 @@ def main():
         }
         
         # Save history
+        # Per-model history file drives later plotting in evaluation script.
         with open(MODELS_DIR / f"{model_name}_history.json", 'w') as f:
             json.dump(history, f, indent=2)
     
     # Save results summary
     print("\n" + "="*80)
-    print("[4/5] Training Summary")
+    print("[5/6] Training Summary")
     print("="*80)
     
     for model_name, metrics in results.items():
@@ -405,7 +448,7 @@ def main():
         json.dump(results_serializable, f, indent=2)
     
     print("\n" + "="*80)
-    print("[5/5] Training complete!")
+    print("[6/6] Training complete!")
     print(f"Models saved to: {MODELS_DIR}")
     print("="*80)
 
