@@ -4,6 +4,7 @@ Training script for ADR prediction models
 
 import sys
 import os
+from pathlib import Path
 
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -264,11 +265,11 @@ def main():
     """Main training pipeline"""
     
     # Configuration
-    BASE_DIR = "/Users/hithaishireddy/Desktop/ADR-project/Prediction-Model-for-Adverse-Drug-Reactions-Using-Deep-Learning-Methods"
-    DATA_DIR = f"{BASE_DIR}/processed_data"
-    MODELS_DIR = f"{BASE_DIR}/models"
+    PROJECT_ROOT = Path(__file__).resolve().parents[1]
+    DATA_DIR = PROJECT_ROOT / "processed_data"
+    MODELS_DIR = PROJECT_ROOT / "models"
     
-    os.makedirs(MODELS_DIR, exist_ok=True)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
     
     # Hyperparameters
     BATCH_SIZE = 1024
@@ -282,10 +283,22 @@ def main():
     
     # Load data
     print("\n[1/5] Loading preprocessed data...")
-    X_train = pd.read_csv(f"{DATA_DIR}/X_train.csv")
-    y_train = pd.read_csv(f"{DATA_DIR}/y_train.csv")
-    X_val = pd.read_csv(f"{DATA_DIR}/X_val.csv")
-    y_val = pd.read_csv(f"{DATA_DIR}/y_val.csv")
+    required_inputs = [
+        DATA_DIR / "X_train.csv",
+        DATA_DIR / "y_train.csv",
+        DATA_DIR / "X_val.csv",
+        DATA_DIR / "y_val.csv",
+    ]
+    missing_inputs = [str(path) for path in required_inputs if not path.exists()]
+    if missing_inputs:
+        raise FileNotFoundError(
+            "Missing required input files:\n- " + "\n- ".join(missing_inputs)
+        )
+
+    X_train = pd.read_csv(DATA_DIR / "X_train.csv")
+    y_train = pd.read_csv(DATA_DIR / "y_train.csv")
+    X_val = pd.read_csv(DATA_DIR / "X_val.csv")
+    y_val = pd.read_csv(DATA_DIR / "y_val.csv")
     
     print(f"Train set: {X_train.shape}")
     print(f"Val set: {X_val.shape}")
@@ -357,7 +370,7 @@ def main():
         )
         
         # Save model
-        model_path = f"{MODELS_DIR}/{model_name}_best.pth"
+        model_path = MODELS_DIR / f"{model_name}_best.pth"
         trainer.save_model(model_path)
         
         # Store results
@@ -368,7 +381,7 @@ def main():
         }
         
         # Save history
-        with open(f"{MODELS_DIR}/{model_name}_history.json", 'w') as f:
+        with open(MODELS_DIR / f"{model_name}_history.json", 'w') as f:
             json.dump(history, f, indent=2)
     
     # Save results summary
@@ -381,7 +394,7 @@ def main():
         print(f"  Best Val AUROC: {metrics['best_val_auroc']:.4f}")
         print(f"  Best Val AUPRC: {metrics['best_val_auprc']:.4f}")
     
-    with open(f"{MODELS_DIR}/training_results.json", 'w') as f:
+    with open(MODELS_DIR / "training_results.json", 'w') as f:
         results_serializable = {
             k: {
                 'best_val_auroc': v['best_val_auroc'],
