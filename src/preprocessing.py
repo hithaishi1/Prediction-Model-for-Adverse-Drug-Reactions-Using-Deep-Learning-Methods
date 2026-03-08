@@ -3,35 +3,47 @@ import numpy as np
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import train_test_split
 import pickle
-from datetime import timedelta
+from pathlib import Path
 
 pd.set_option("display.max_columns", 50)
 pd.set_option("display.width", 120)
 
 # Configuration
-BASE_DIR = "/Users/hithaishireddy/Desktop/ADR-project/Prediction-Model-for-Adverse-Drug-Reactions-Using-Deep-Learning-Methods"
-DATA_DIR = f"{BASE_DIR}/data/hosp"
-OUTPUT_DIR = f"{BASE_DIR}/processed_data"
-ADR_LABELS_PATH = f"{BASE_DIR}/notebooks/adr_labels.csv"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = PROJECT_ROOT / "data" / "hosp"
+OUTPUT_DIR = PROJECT_ROOT / "processed_data"
+ADR_LABELS_PATH = PROJECT_ROOT / "notebooks" / "adr_labels.csv"
 RANDOM_STATE = 42
 
 print("="*80)
 print("MIMIC-IV ADR Prediction - Data Preprocessing Pipeline")
 print("="*80)
 
+required_inputs = [
+    DATA_DIR / "patients.csv.gz",
+    DATA_DIR / "prescriptions.csv.gz",
+    DATA_DIR / "diagnoses_icd.csv.gz",
+    ADR_LABELS_PATH,
+]
+missing_inputs = [str(path) for path in required_inputs if not path.exists()]
+if missing_inputs:
+    raise FileNotFoundError(
+        "Missing required input files:\n- " + "\n- ".join(missing_inputs)
+    )
+
 # ============================================================================
 # 1. LOAD DATA
 # ============================================================================
 print("\n[1/8] Loading data...")
 
-patients = pd.read_csv(f"{DATA_DIR}/patients.csv.gz")
+patients = pd.read_csv(DATA_DIR / "patients.csv.gz")
 prescriptions = pd.read_csv(
-    f"{DATA_DIR}/prescriptions.csv.gz",
+    DATA_DIR / "prescriptions.csv.gz",
     usecols=["subject_id", "hadm_id", "drug", "starttime", "stoptime", 
              "dose_val_rx", "dose_unit_rx", "route"]
 )
 diagnoses = pd.read_csv(
-    f"{DATA_DIR}/diagnoses_icd.csv.gz",
+    DATA_DIR / "diagnoses_icd.csv.gz",
     usecols=["subject_id", "hadm_id", "icd_code", "icd_version"]
 )
 adr_labels = pd.read_csv(ADR_LABELS_PATH)
@@ -236,31 +248,30 @@ print(f"Test set:  {X_test.shape}, ADR rate: {y_test.mean():.3f}")
 # ============================================================================
 print("\n[9/9] Saving processed data...")
 
-import os
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Save splits
-X_train.to_csv(f"{OUTPUT_DIR}/X_train.csv", index=False)
-X_val.to_csv(f"{OUTPUT_DIR}/X_val.csv", index=False)
-X_test.to_csv(f"{OUTPUT_DIR}/X_test.csv", index=False)
+X_train.to_csv(OUTPUT_DIR / "X_train.csv", index=False)
+X_val.to_csv(OUTPUT_DIR / "X_val.csv", index=False)
+X_test.to_csv(OUTPUT_DIR / "X_test.csv", index=False)
 
-y_train.to_csv(f"{OUTPUT_DIR}/y_train.csv", index=False)
-y_val.to_csv(f"{OUTPUT_DIR}/y_val.csv", index=False)
-y_test.to_csv(f"{OUTPUT_DIR}/y_test.csv", index=False)
+y_train.to_csv(OUTPUT_DIR / "y_train.csv", index=False)
+y_val.to_csv(OUTPUT_DIR / "y_val.csv", index=False)
+y_test.to_csv(OUTPUT_DIR / "y_test.csv", index=False)
 
 # Save preprocessors
-with open(f"{OUTPUT_DIR}/label_encoders.pkl", "wb") as f:
+with open(OUTPUT_DIR / "label_encoders.pkl", "wb") as f:
     pickle.dump(label_encoders, f)
 
-with open(f"{OUTPUT_DIR}/scaler.pkl", "wb") as f:
+with open(OUTPUT_DIR / "scaler.pkl", "wb") as f:
     pickle.dump(scaler, f)
 
 # Save feature names
-with open(f"{OUTPUT_DIR}/feature_names.txt", "w") as f:
+with open(OUTPUT_DIR / "feature_names.txt", "w") as f:
     f.write("\n".join(feature_cols))
 
 # Save full processed dataset for reference
-data.to_csv(f"{OUTPUT_DIR}/full_processed_data.csv", index=False)
+data.to_csv(OUTPUT_DIR / "full_processed_data.csv", index=False)
 
 print(f"\nAll data saved to {OUTPUT_DIR}/")
 

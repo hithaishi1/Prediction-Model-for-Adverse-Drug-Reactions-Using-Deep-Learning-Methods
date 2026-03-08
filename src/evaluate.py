@@ -4,6 +4,7 @@ Comprehensive evaluation script for ADR prediction models
 
 import sys
 import os
+from pathlib import Path
 
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -263,12 +264,12 @@ def main():
     """Main evaluation pipeline"""
     
     # Configuration
-    BASE_DIR = "/Users/hithaishireddy/Desktop/ADR-project/Prediction-Model-for-Adverse-Drug-Reactions-Using-Deep-Learning-Methods"
-    DATA_DIR = f"{BASE_DIR}/processed_data"
-    MODELS_DIR = f"{BASE_DIR}/models"
-    RESULTS_DIR = f"{BASE_DIR}/results"
+    PROJECT_ROOT = Path(__file__).resolve().parents[1]
+    DATA_DIR = PROJECT_ROOT / "processed_data"
+    MODELS_DIR = PROJECT_ROOT / "models"
+    RESULTS_DIR = PROJECT_ROOT / "results"
     
-    os.makedirs(RESULTS_DIR, exist_ok=True)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     BATCH_SIZE = 1024
@@ -279,8 +280,18 @@ def main():
     
     # Load test data
     print("\n[1/4] Loading test data...")
-    X_test = pd.read_csv(f"{DATA_DIR}/X_test.csv")
-    y_test = pd.read_csv(f"{DATA_DIR}/y_test.csv")
+    required_inputs = [
+        DATA_DIR / "X_test.csv",
+        DATA_DIR / "y_test.csv",
+    ]
+    missing_inputs = [str(path) for path in required_inputs if not path.exists()]
+    if missing_inputs:
+        raise FileNotFoundError(
+            "Missing required input files:\n- " + "\n- ".join(missing_inputs)
+        )
+
+    X_test = pd.read_csv(DATA_DIR / "X_test.csv")
+    y_test = pd.read_csv(DATA_DIR / "y_test.csv")
     
     print(f"Test set: {X_test.shape}")
     print(f"ADR rate: {y_test.mean().values[0]:.3f}")
@@ -318,9 +329,9 @@ def main():
     
     for model_name, config in models_to_eval.items():
         # Load model
-        model_path = f"{MODELS_DIR}/{model_name}_best.pth"
+        model_path = MODELS_DIR / f"{model_name}_best.pth"
         
-        if not os.path.exists(model_path):
+        if not model_path.exists():
             print(f"Model not found: {model_path}. Skipping...")
             continue
         
@@ -336,14 +347,14 @@ def main():
         evaluation_results[model_name] = results
         
         # Plot training history
-        history_path = f"{MODELS_DIR}/{model_name}_history.json"
-        if os.path.exists(history_path):
+        history_path = MODELS_DIR / f"{model_name}_history.json"
+        if history_path.exists():
             with open(history_path, 'r') as f:
                 history = json.load(f)
             plot_training_history(
                 history, 
                 model_name, 
-                save_path=f"{RESULTS_DIR}/{model_name}_training_history.png"
+                save_path=RESULTS_DIR / f"{model_name}_training_history.png"
             )
         
         # Plot confusion matrix
@@ -351,13 +362,13 @@ def main():
             results['y_true'],
             results['y_pred_default'],
             model_name,
-            save_path=f"{RESULTS_DIR}/{model_name}_confusion_matrix.png"
+            save_path=RESULTS_DIR / f"{model_name}_confusion_matrix.png"
         )
     
     # Generate comparison plots
     print("\n[3/4] Generating comparison plots...")
-    plot_roc_curves(evaluation_results, save_path=f"{RESULTS_DIR}/roc_curves_comparison.png")
-    plot_pr_curves(evaluation_results, save_path=f"{RESULTS_DIR}/pr_curves_comparison.png")
+    plot_roc_curves(evaluation_results, save_path=RESULTS_DIR / "roc_curves_comparison.png")
+    plot_pr_curves(evaluation_results, save_path=RESULTS_DIR / "pr_curves_comparison.png")
     
     # Print evaluation report
     print("\n[4/4] Generating evaluation report...")
@@ -380,7 +391,7 @@ def main():
             }
         }
     
-    with open(f"{RESULTS_DIR}/evaluation_results.json", 'w') as f:
+    with open(RESULTS_DIR / "evaluation_results.json", 'w') as f:
         json.dump(results_summary, f, indent=2)
     
     print("\n" + "="*80)

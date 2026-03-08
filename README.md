@@ -81,3 +81,56 @@ Example command (downloads hospital tables only):
 ```bash
 wget -r -N -c -np --user=YOUR_PHYSIONET_USERNAME --ask-password \
 https://physionet.org/files/mimiciv/2.2/hosp/
+```
+
+## Project Layout
+
+- `data/hosp/` (not tracked): raw MIMIC-IV hospital CSVs (`patients.csv.gz`, `prescriptions.csv.gz`, `diagnoses_icd.csv.gz`, etc.)
+- `notebooks/`: EDA, ADR labeling, and baseline ML notebooks
+- `src/preprocessing.py`: tabular feature engineering + train/val/test split generation
+- `src/train.py`: deep learning training (MLP/ResNet/Attention)
+- `src/evaluate.py`: model evaluation and plotting
+- `processed_data/`: generated train/val/test files and preprocessing artifacts
+- `models/`: saved model checkpoints and training histories
+- `results/`: generated evaluation plots and metrics summaries
+
+## Setup
+
+From the repository root:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## Run Pipeline
+
+1. Generate ADR labels:
+
+   - Open `notebooks/02_adr_labeling.ipynb`
+   - Run all cells and save `adr_labels.csv` in `notebooks/`
+
+2. Preprocess and create model-ready splits:
+
+```bash
+python src/preprocessing.py
+```
+
+3. Train deep models:
+
+```bash
+python src/train.py
+```
+
+4. Evaluate trained models:
+
+```bash
+python src/evaluate.py
+```
+
+## Notes
+
+- Scripts now use repo-relative paths automatically, so no machine-specific path edits are required.
+- If a required file is missing, scripts raise a clear `FileNotFoundError` listing missing paths.
+- Notebooks auto-detect whether you launched Jupyter from repo root or from `notebooks/`.
