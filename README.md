@@ -117,17 +117,59 @@ pip install -r requirements.txt
 python src/preprocessing.py
 ```
 
-3. Train deep models:
+3. Train/evaluate baseline ML models (notebook):
+
+   - Open `notebooks/03_baseline_models.ipynb`
+   - Run all cells after preprocessing outputs are available
+   - The notebook now:
+     - validates split schema before training
+     - handles class imbalance for Gradient Boosting via sample weights
+     - selects the best model by **validation AUROC**
+     - tunes a decision threshold on validation F1 and applies it once on test data
+     - saves machine-readable artifacts in `results/`
+
+4. Train deep models:
 
 ```bash
 python src/train.py
 ```
 
-4. Evaluate trained models:
+   - `src/train.py` now runs two stages per deep model (`mlp`, `resnet`, `attention`):
+     - initial training phase
+     - fine-tuning phase at lower learning rate with separate early stopping
+   - Fine-tuning defaults are configurable near the top of `main()` in `src/train.py`:
+     - `ENABLE_FINE_TUNING`
+     - `FINE_TUNE_LR_FACTOR`
+     - `FINE_TUNE_EPOCHS`
+     - `FINE_TUNE_PATIENCE`
+
+5. Evaluate trained deep models:
 
 ```bash
 python src/evaluate.py
 ```
+
+6. (Optional) Run deep learning workflow in notebook form:
+
+   - Open `notebooks/04_deep_learning_models.ipynb`
+   - Train/evaluate deep models (`mlp`, `resnet`, `attention`) interactively
+   - Saves notebook-level deep artifacts in `results/`:
+     - `deep_models_metrics.csv`
+     - `deep_models_metrics.json`
+     - `deep_models_test_predictions.json`
+     - `deep_best_model_confusion_matrix.png`
+
+## Baseline Artifacts (Generated in `results/`)
+
+- `baseline_models_metrics.csv`
+- `baseline_models_metrics.json`
+- `baseline_models_comparison.png`
+- `best_baseline_test_predictions.csv`
+- `best_baseline_threshold_tuning.csv`
+- `best_baseline_classification_report.json`
+- `best_baseline_confusion_matrix.png`
+- `feature_importance_top10.csv` (when available from the selected model)
+- `feature_importance.png` (when available from the selected model)
 
 ## Notes
 

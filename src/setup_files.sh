@@ -6,15 +6,18 @@
 echo "Setting up ADR Prediction project structure..."
 
 # Get the base directory (where this script is run from)
+# Keeping BASE_DIR explicit helps if additional path checks are added later.
 BASE_DIR=$(pwd)
 
 # Create necessary directories
+# `-p` makes this idempotent, so rerunning the script is safe.
 echo "Creating directories..."
 mkdir -p models
 mkdir -p results
 mkdir -p notebooks
 
 # Check if files exist
+# These checks verify that core pipeline scripts are present before running.
 echo ""
 echo "Checking required files..."
 
@@ -50,6 +53,7 @@ fi
 
 echo ""
 echo "Checking processed data..."
+# Presence of `X_train.csv` is a lightweight signal that preprocessing ran.
 if [ -d "processed_data" ] && [ -f "processed_data/X_train.csv" ]; then
     echo "✓ Processed data found"
 else

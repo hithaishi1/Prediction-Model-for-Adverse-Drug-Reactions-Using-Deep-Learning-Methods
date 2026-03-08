@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 # Add parent directory to path for imports
+# Allows direct script execution without installing as a package.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import torch
@@ -35,6 +36,7 @@ except ImportError:
 
 def plot_roc_curves(results_dict, save_path=None):
     """Plot ROC curves for all models"""
+    # Shared comparison plot makes cross-model operating characteristics obvious.
     plt.figure(figsize=(10, 8))
     
     for model_name, metrics in results_dict.items():
@@ -57,6 +59,7 @@ def plot_roc_curves(results_dict, save_path=None):
 
 def plot_pr_curves(results_dict, save_path=None):
     """Plot Precision-Recall curves for all models"""
+    # PR curves are especially useful for imbalanced ADR detection tasks.
     plt.figure(figsize=(10, 8))
     
     for model_name, metrics in results_dict.items():
@@ -78,6 +81,7 @@ def plot_pr_curves(results_dict, save_path=None):
 
 def plot_confusion_matrix(y_true, y_pred, model_name, save_path=None):
     """Plot confusion matrix"""
+    # Confusion matrix is threshold-dependent (here based on chosen predictions).
     cm = confusion_matrix(y_true, y_pred)
     
     plt.figure(figsize=(8, 6))
@@ -96,6 +100,7 @@ def plot_confusion_matrix(y_true, y_pred, model_name, save_path=None):
 
 def plot_training_history(history, model_name, save_path=None):
     """Plot training history"""
+    # Plot all tracked train/val metrics in one figure for overfitting checks.
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     
     # Loss
@@ -136,6 +141,7 @@ def plot_training_history(history, model_name, save_path=None):
 
 def calculate_metrics_at_thresholds(y_true, y_proba, thresholds=[0.3, 0.5, 0.7]):
     """Calculate metrics at different thresholds"""
+    # Return per-threshold operating point stats for decision support.
     results = {}
     
     for threshold in thresholds:
@@ -162,6 +168,7 @@ def calculate_metrics_at_thresholds(y_true, y_proba, thresholds=[0.3, 0.5, 0.7])
 
 def evaluate_model(model, test_loader, device, model_name):
     """Comprehensive model evaluation"""
+    # Keep model in eval mode so dropout/batchnorm behavior is deterministic.
     model.eval()
     all_preds = []
     all_targets = []
@@ -177,7 +184,7 @@ def evaluate_model(model, test_loader, device, model_name):
     y_true = np.array(all_targets).flatten()
     y_proba = np.array(all_preds).flatten()
     
-    # Calculate metrics
+    # Global ranking metrics (threshold-free).
     auroc = roc_auc_score(y_true, y_proba)
     auprc = average_precision_score(y_true, y_proba)
     
@@ -190,7 +197,7 @@ def evaluate_model(model, test_loader, device, model_name):
     # Metrics at different thresholds
     threshold_metrics = calculate_metrics_at_thresholds(y_true, y_proba)
     
-    # Default threshold (0.5)
+    # Binary predictions for a standard baseline operating point.
     y_pred_default = (y_proba >= 0.5).astype(int)
     
     results = {
@@ -230,7 +237,7 @@ def print_evaluation_report(results_dict):
               f"{threshold_metrics['sensitivity']:<12.4f} "
               f"{threshold_metrics['specificity']:<12.4f}")
     
-    # Detailed metrics for best model
+    # Detailed section for best AUROC model.
     best_model = max(results_dict.items(), key=lambda x: x[1]['auroc'])
     model_name, metrics = best_model
     
@@ -264,6 +271,7 @@ def main():
     """Main evaluation pipeline"""
     
     # Configuration
+    # Resolve directories from repository root so this script is portable.
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
     DATA_DIR = PROJECT_ROOT / "processed_data"
     MODELS_DIR = PROJECT_ROOT / "models"
@@ -297,6 +305,7 @@ def main():
     print(f"ADR rate: {y_test.mean().values[0]:.3f}")
     
     # Create test dataset
+    # Reuses ADRDataset to guarantee identical tensor conversion semantics.
     test_dataset = ADRDataset(X_test, y_test)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
     
@@ -332,6 +341,7 @@ def main():
         model_path = MODELS_DIR / f"{model_name}_best.pth"
         
         if not model_path.exists():
+            # Skip missing checkpoints rather than failing entire evaluation pass.
             print(f"Model not found: {model_path}. Skipping...")
             continue
         
@@ -347,6 +357,7 @@ def main():
         evaluation_results[model_name] = results
         
         # Plot training history
+        # Histories are optional (e.g., if training was interrupted or files removed).
         history_path = MODELS_DIR / f"{model_name}_history.json"
         if history_path.exists():
             with open(history_path, 'r') as f:
@@ -375,6 +386,7 @@ def main():
     print_evaluation_report(evaluation_results)
     
     # Save results
+    # Serialize to plain Python floats for JSON compatibility.
     results_summary = {}
     for model_name, metrics in evaluation_results.items():
         results_summary[model_name] = {
