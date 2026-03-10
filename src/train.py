@@ -21,6 +21,7 @@ from tqdm import tqdm
 import pickle
 import json
 from datetime import datetime
+import random
 
 # Import models
 try:
@@ -29,6 +30,21 @@ except ImportError:
     print("Error: models.py not found in the same directory as train.py")
     print("Please ensure models.py is in the src/ directory")
     sys.exit(1)
+
+
+def set_global_seed(seed):
+    """Set random seeds for reproducible training runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 class ADRDataset(Dataset):
@@ -302,10 +318,14 @@ def main():
     FINE_TUNE_LR_FACTOR = 0.1
     FINE_TUNE_EPOCHS = 15
     FINE_TUNE_PATIENCE = 5
+    RANDOM_SEED = 42
     
     print("="*80)
     print("ADR Prediction Model Training")
     print("="*80)
+
+    set_global_seed(RANDOM_SEED)
+    print(f"Random seed: {RANDOM_SEED}")
     
     # Load data
     print("\n[1/6] Loading preprocessed data...")
@@ -334,9 +354,22 @@ def main():
     print("\n[2/6] Creating PyTorch datasets...")
     train_dataset = ADRDataset(X_train, y_train)
     val_dataset = ADRDataset(X_val, y_val)
-    
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+
+    loader_generator = torch.Generator().manual_seed(RANDOM_SEED)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=0,
+        generator=loader_generator
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=0
+    )
     
     # Calculate class weights
     # Computed for reference and optional BCE weighting if needed.
