@@ -32,6 +32,15 @@ except ImportError:
     sys.exit(1)
 
 
+def get_best_device():
+    """Prefer CUDA, then Apple Metal, and fall back to CPU."""
+    if torch.cuda.is_available():
+        return 'cuda'
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return 'mps'
+    return 'cpu'
+
+
 def set_global_seed(seed):
     """Set random seeds for reproducible training runs."""
     random.seed(seed)
@@ -106,11 +115,12 @@ class Trainer:
     
     def __init__(self, 
                  model, 
-                 device='cuda' if torch.cuda.is_available() else 'cpu',
+                 device=None,
                  learning_rate=0.001,
                  loss_type='focal',
                  class_weights=None):
-        
+        if device is None:
+            device = get_best_device()
         self.model = model.to(device)
         self.device = device
         
@@ -133,9 +143,7 @@ class Trainer:
         
         # Learning rate scheduler
         # Reduce LR when validation AUROC plateaus to stabilize late training.
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='max', factor=0.5, patience=5, verbose=True
-        )
+        self.scheduler = self._build_scheduler()
         
         # Training history
         self.history = {
@@ -259,9 +267,18 @@ class Trainer:
             param_group['lr'] = learning_rate
 
         # Reset scheduler state so fine-tuning has its own plateau tracking window.
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='max', factor=0.5, patience=5, verbose=True
-        )
+        self.scheduler = self._build_scheduler()
+
+    def _build_scheduler(self):
+        """Create a ReduceLROnPlateau scheduler compatible across torch versions."""
+        try:
+            return optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, mode='max', factor=0.5, patience=5, verbose=True
+            )
+        except TypeError:
+            return optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, mode='max', factor=0.5, patience=5
+            )
     
     def predict(self, test_loader):
         """Generate predictions"""
@@ -290,7 +307,10 @@ class Trainer:
     
     def load_model(self, filepath):
         """Load model and training history"""
-        checkpoint = torch.load(filepath, map_location=self.device)
+        try:
+            checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(filepath, map_location=self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.history = checkpoint['history']
@@ -320,12 +340,15 @@ def main():
     FINE_TUNE_PATIENCE = 5
     RANDOM_SEED = 42
     
+    device = get_best_device()
+
     print("="*80)
     print("ADR Prediction Model Training")
     print("="*80)
 
     set_global_seed(RANDOM_SEED)
     print(f"Random seed: {RANDOM_SEED}")
+    print(f"Selected device: {device}")
     
     # Load data
     print("\n[1/6] Loading preprocessed data...")
@@ -419,6 +442,7 @@ def main():
         # Using focal loss here; class_weights currently not passed.
         trainer = Trainer(
             model, 
+            device=device,
             learning_rate=LEARNING_RATE,
             loss_type='focal',
             class_weights=None  # Using focal loss instead

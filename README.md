@@ -12,7 +12,7 @@ Drugs often have a list of side effects, and sometimes they include the prevalen
 
 Objectives
 
-Clean, preprocess, and analyze the FAERS dataset from the FDA and MIMIC-IV dataset.
+Clean, preprocess, and analyze the MIMIC-IV dataset.
 Explore and implement machine learning and deep learning methods using a large dataset.
 Provide useful insights about drug side effects, in the form of a personalized predictor model.
 
@@ -40,13 +40,7 @@ https://physionet.org/content/mimiciv/2.2/
 ## Data Access and Usage Policy
 
 The MIMIC-IV dataset is a **restricted-access dataset** governed by a PhysioNet data use agreement.  
-As a result:
-
-- ❌ The dataset **cannot be redistributed**
-- ❌ The dataset **is NOT uploaded to this GitHub repository**
-- ✅ All code and analysis scripts are provided for authorized users to run locally after downloading the data directly from PhysioNet
-
-This repository contains **only code, documentation, and instructions**.
+As a result, we cannot upload the dataset to the GitHub repository and can only store the data on our local computers.
 
 ---
 

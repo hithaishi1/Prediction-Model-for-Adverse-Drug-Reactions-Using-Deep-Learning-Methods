@@ -27,7 +27,7 @@ from tqdm import tqdm
 # Import local modules
 try:
     from models import get_model
-    from train import ADRDataset, Trainer
+    from train import ADRDataset, Trainer, get_best_device
 except ImportError:
     print("Error: models.py or train.py not found in the same directory")
     print("Please ensure all files are in the src/ directory")
@@ -279,12 +279,13 @@ def main():
     
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = get_best_device()
     BATCH_SIZE = 1024
     
     print("="*80)
     print("ADR Prediction Model Evaluation")
     print("="*80)
+    print(f"Selected device: {device}")
     
     # Load test data
     print("\n[1/4] Loading test data...")
