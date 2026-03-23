@@ -13,6 +13,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import torch
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend — prevents plt.show() from blocking
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import (
@@ -349,7 +351,7 @@ def main():
         model_type = config.pop('model_type')
         model = get_model(model_type, **config)
         
-        checkpoint = torch.load(model_path, map_location=device)
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.to(device)
         

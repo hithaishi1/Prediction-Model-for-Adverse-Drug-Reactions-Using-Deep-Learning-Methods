@@ -595,7 +595,7 @@ run_expanded_pipeline(data, OUTPUT_DIR_EXPANDED, "Full")
 # 11. EXPANDED FEATURE PIPELINE — MIN1000 DATASET
 # ============================================================================
 print("\n[11] Saving expanded feature dataset (min1000)...")
-run_expanded_pipeline(data_min1000, OUTPUT_DIR_MIN1000_EXPANDED, f"Min{MIN_DRUG_COUNT}")
+run_expanded_pipeline(data[data["drug"].isin(qualifying_drugs)].copy(), OUTPUT_DIR_MIN1000_EXPANDED, f"Min{MIN_DRUG_COUNT}")
 
 print("\n" + "="*80)
 print("PREPROCESSING COMPLETE!")
