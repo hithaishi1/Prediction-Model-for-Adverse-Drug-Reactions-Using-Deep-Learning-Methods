@@ -194,7 +194,7 @@ data = data.merge(polypharmacy, on=["subject_id", "hadm_id"], how="left")
 data = data.merge(renal_per_adm, on=["subject_id", "hadm_id"], how="left")
 data = data.merge(liver_per_adm, on=["subject_id", "hadm_id"], how="left")
 data = data.merge(
-    admissions_supp[["subject_id", "hadm_id", "admission_type"]],
+    admissions_supp[["subject_id", "hadm_id", "admission_type", "admittime"]],
     on=["subject_id", "hadm_id"], how="left",
 )
 data = data.merge(icu_flag, on=["subject_id", "hadm_id"], how="left")
@@ -295,20 +295,35 @@ data["log_dose"] = np.log1p(data["dose_val_rx"])
 drug_freq = data["drug"].value_counts()
 data["drug_frequency"] = data["drug"].map(drug_freq)
 
-# Patient history features (number of admissions and prescriptions)
-# Encounter and prescription counts approximate comorbidity/complexity.
-patient_admissions = data.groupby("subject_id")["hadm_id"].nunique()
-data["patient_admission_count"] = data["subject_id"].map(patient_admissions)
+# Patient history features — cumulative up to current admission only.
+# Using all-time counts would leak future admission/prescription data into past rows.
+def add_cumulative_patient_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add patient_admission_count and patient_prescription_count as cumulative
+    counts up to and including the current admission, ordered by admittime."""
+    adm_order = (
+        df[["subject_id", "hadm_id", "admittime"]]
+        .drop_duplicates(subset=["subject_id", "hadm_id"])
+        .sort_values(["subject_id", "admittime"])
+        .copy()
+    )
+    adm_order["patient_admission_count"] = adm_order.groupby("subject_id").cumcount() + 1
 
-patient_prescriptions = data.groupby("subject_id").size()
-data["patient_prescription_count"] = data["subject_id"].map(patient_prescriptions)
+    adm_rx = (
+        df.groupby(["subject_id", "hadm_id"])
+        .size()
+        .reset_index(name="_adm_rx")
+        .merge(adm_order[["subject_id", "hadm_id", "admittime"]], on=["subject_id", "hadm_id"], how="left")
+        .sort_values(["subject_id", "admittime"])
+    )
+    adm_rx["patient_prescription_count"] = adm_rx.groupby("subject_id")["_adm_rx"].cumsum()
 
-# Risk score based on age and prescription count
-# Simple hand-crafted risk prior used as an additional model input.
-data["risk_score"] = (
-    data["anchor_age"] / 100 + 
-    np.log1p(data["patient_prescription_count"]) / 10
-)
+    df = df.merge(adm_order[["subject_id", "hadm_id", "patient_admission_count"]],
+                  on=["subject_id", "hadm_id"], how="left")
+    df = df.merge(adm_rx[["subject_id", "hadm_id", "patient_prescription_count"]],
+                  on=["subject_id", "hadm_id"], how="left")
+    return df
+
+data = add_cumulative_patient_features(data)
 
 print(f"\nFeatures created. New shape: {data.shape}")
 
@@ -349,7 +364,6 @@ feature_cols = [
     "drug_frequency",
     "patient_admission_count",
     "patient_prescription_count",
-    "risk_score"
 ]
 
 X = data[feature_cols].copy()
@@ -378,7 +392,6 @@ numerical_cols = [
     "drug_frequency",
     "patient_admission_count",
     "patient_prescription_count",
-    "risk_score"
 ]
 
 scaler = StandardScaler()
@@ -470,12 +483,7 @@ data_m["age_group"] = pd.cut(
 data_m["log_dose"] = np.log1p(data_m["dose_val_rx"].clip(lower=0))
 drug_freq_m = data_m["drug"].value_counts()
 data_m["drug_frequency"] = data_m["drug"].map(drug_freq_m)
-patient_admissions_m = data_m.groupby("subject_id")["hadm_id"].nunique()
-data_m["patient_admission_count"] = data_m["subject_id"].map(patient_admissions_m)
-patient_prescriptions_m = data_m.groupby("subject_id").size()
-data_m["patient_prescription_count"] = data_m["subject_id"].map(patient_prescriptions_m)
-data_m["risk_score"] = data_m["anchor_age"] / 100 + np.log1p(data_m["patient_prescription_count"]) / 10
-
+data_m = add_cumulative_patient_features(data_m)
 label_encoders_m = {}
 for col in categorical_cols:
     le_m = LabelEncoder()
