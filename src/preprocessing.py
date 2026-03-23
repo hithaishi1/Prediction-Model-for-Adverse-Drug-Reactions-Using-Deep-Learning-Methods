@@ -13,7 +13,7 @@ pd.set_option("display.width", 120)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data" / "hosp"
 OUTPUT_DIR = PROJECT_ROOT / "processed_data"
-OUTPUT_DIR_MIN1000 = PROJECT_ROOT / "processed_data_min1000_private"
+OUTPUT_DIR_MIN1000 = PROJECT_ROOT / "processed_data_min1000"
 OUTPUT_DIR_EXPANDED = PROJECT_ROOT / "processed_data_expanded"
 OUTPUT_DIR_MIN1000_EXPANDED = PROJECT_ROOT / "processed_data_min1000_expanded"
 ICU_DIR = PROJECT_ROOT / "data" / "icu"

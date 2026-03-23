@@ -40,7 +40,7 @@ def load_dataset(dataset: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame
     dirs = {
         "min1000_expanded": PROJECT_ROOT / "processed_data_min1000_expanded",
         "expanded":         PROJECT_ROOT / "processed_data_expanded",
-        "min1000":          PROJECT_ROOT / "processed_data_min1000_private",
+        "min1000":          PROJECT_ROOT / "processed_data_min1000",
         "base":             PROJECT_ROOT / "processed_data",
     }
     if dataset not in dirs:
