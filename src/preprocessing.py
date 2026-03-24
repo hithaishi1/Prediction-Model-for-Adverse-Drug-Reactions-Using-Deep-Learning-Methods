@@ -549,8 +549,6 @@ def run_expanded_pipeline(df, output_dir, label):
         "renal_flag",
         "liver_flag",
         "admission_type_encoded",
-        "icu_stay",
-        "prior_adr",
         "creatinine",
         "alt",
         "ast",
