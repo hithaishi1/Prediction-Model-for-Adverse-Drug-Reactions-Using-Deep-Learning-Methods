@@ -5,10 +5,14 @@ Tunes the MLP classifier on the min1000 expanded feature dataset.
 Searches over learning rate, dropout, focal loss alpha/gamma, and
 hidden layer width. Results are saved to results/tuning/.
 
+Progress is saved to an SQLite database so runs can be stopped and
+resumed. Each invocation adds --trials more trials to the same study.
+
 Usage:
-    python src/tune.py                    # 50 trials, MLP, min1000 expanded
-    python src/tune.py --trials 100
+    python src/tune.py                    # run 20 trials (resumable)
+    python src/tune.py --trials 50        # run 50 trials
     python src/tune.py --dataset expanded # full expanded dataset
+    python src/tune.py --reset            # delete saved study and start fresh
 """
 
 import sys
@@ -33,6 +37,7 @@ from train import ADRDataset, get_best_device, set_global_seed
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RANDOM_STATE = 42
+EXCLUDE_COLS = ["prior_adr", "icu_stay"]
 
 
 def load_dataset(dataset: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -55,6 +60,10 @@ def load_dataset(dataset: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame
     y_train = pd.read_csv(d / "y_train.csv")
     X_val   = pd.read_csv(d / "X_val.csv")
     y_val   = pd.read_csv(d / "y_val.csv")
+
+    # Drop leaky/excluded columns
+    X_train = X_train.drop(columns=[c for c in EXCLUDE_COLS if c in X_train.columns])
+    X_val   = X_val.drop(columns=[c for c in EXCLUDE_COLS if c in X_val.columns])
     return X_train, y_train, X_val, y_val
 
 
@@ -80,6 +89,12 @@ def run_trial(
     hidden_dims = [width // (2 ** i) for i in range(depth)]
     # Clamp minimum layer size to 32 to avoid overly narrow final layers
     hidden_dims = [max(32, d) for d in hidden_dims]
+
+    print(f"\n{'='*60}")
+    print(f"Trial {trial.number}  |  lr={lr:.5f}  dropout={dropout}  "
+          f"alpha={focal_alpha}  gamma={focal_gamma}")
+    print(f"             |  hidden={hidden_dims}  batch={batch_size}")
+    print(f"{'='*60}")
 
     set_global_seed(RANDOM_STATE)
     loader_gen = torch.Generator().manual_seed(RANDOM_STATE)
@@ -110,12 +125,14 @@ def run_trial(
     for epoch in range(MAX_EPOCHS):
         # Train
         model.train()
+        epoch_loss = 0.0
         for X_batch, y_batch in train_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             optimizer.zero_grad()
             loss = criterion(model(X_batch), y_batch)
             loss.backward()
             optimizer.step()
+            epoch_loss += loss.item()
 
         # Validate
         model.eval()
@@ -127,10 +144,15 @@ def run_trial(
                 vtargets.extend(y_batch.numpy())
 
         val_auroc = roc_auc_score(vtargets, vpreds)
+        avg_loss = epoch_loss / len(train_loader)
+        marker = " *" if val_auroc > best_val_auroc + 0.001 else ""
+        print(f"  Epoch {epoch+1:02d}/{MAX_EPOCHS}  loss={avg_loss:.4f}  "
+              f"val_auroc={val_auroc:.4f}{marker}")
 
         # Optuna pruning: abort unpromising trials early
         trial.report(val_auroc, epoch)
         if trial.should_prune():
+            print(f"  Pruned at epoch {epoch+1}.")
             raise optuna.exceptions.TrialPruned()
 
         if val_auroc > best_val_auroc + 0.001:
@@ -139,20 +161,30 @@ def run_trial(
         else:
             patience_counter += 1
             if patience_counter >= PATIENCE:
+                print(f"  Early stop (patience={PATIENCE}).")
                 break
 
+    print(f"  => Best val AUROC: {best_val_auroc:.4f}")
     return best_val_auroc
 
 
-def tune(n_trials: int = 50, dataset: str = "min1000_expanded") -> None:
-    """Run the Optuna study and save results."""
+def tune(n_trials: int = 20, dataset: str = "min1000_expanded", reset: bool = False) -> None:
+    """Run the Optuna study and save results. Resumes automatically if a prior study exists."""
     results_dir = PROJECT_ROOT / "results" / "tuning"
     results_dir.mkdir(parents=True, exist_ok=True)
+
+    db_path = results_dir / f"tuning_{dataset}.db"
+    storage = f"sqlite:///{db_path}"
+    study_name = f"mlp_{dataset}"
+
+    if reset and db_path.exists():
+        db_path.unlink()
+        print(f"Deleted existing study: {db_path}")
 
     device = get_best_device()
     print(f"Device: {device}")
     print(f"Dataset: {dataset}")
-    print(f"Trials: {n_trials}")
+    print(f"Trials this run: {n_trials}")
 
     X_train, y_train, X_val, y_val = load_dataset(dataset)
     print(f"Train: {X_train.shape}  Val: {X_val.shape}  "
@@ -162,8 +194,14 @@ def tune(n_trials: int = 50, dataset: str = "min1000_expanded") -> None:
         direction="maximize",
         sampler=TPESampler(seed=RANDOM_STATE),
         pruner=optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=5),
-        study_name=f"mlp_{dataset}",
+        study_name=study_name,
+        storage=storage,
+        load_if_exists=True,
     )
+
+    completed_before = len([t for t in study.trials if t.value is not None])
+    if completed_before > 0:
+        print(f"Resuming study — {completed_before} trials already completed.")
 
     study.optimize(
         lambda trial: run_trial(trial, X_train, y_train, X_val, y_val, device),
@@ -179,9 +217,10 @@ def tune(n_trials: int = 50, dataset: str = "min1000_expanded") -> None:
     print(f"  Params:    {best.params}")
 
     # Save full results
+    total_completed = len([t for t in study.trials if t.value is not None])
     summary = {
         "dataset": dataset,
-        "n_trials": n_trials,
+        "total_trials_completed": total_completed,
         "best_val_auroc": best.value,
         "best_params": best.params,
         "all_trials": [
@@ -214,10 +253,12 @@ def tune(n_trials: int = 50, dataset: str = "min1000_expanded") -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Optuna hyperparameter tuning for ADR MLP")
-    parser.add_argument("--trials",  type=int, default=50,
-                        help="Number of Optuna trials (default: 50)")
+    parser.add_argument("--trials",  type=int, default=20,
+                        help="Number of trials to run this session (default: 20)")
     parser.add_argument("--dataset", type=str, default="min1000_expanded",
                         choices=["min1000_expanded", "expanded", "min1000", "base"],
                         help="Which processed dataset to tune on (default: min1000_expanded)")
+    parser.add_argument("--reset", action="store_true",
+                        help="Delete saved study and start fresh")
     args = parser.parse_args()
-    tune(n_trials=args.trials, dataset=args.dataset)
+    tune(n_trials=args.trials, dataset=args.dataset, reset=args.reset)
