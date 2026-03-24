@@ -13,3 +13,7 @@ ipykernel==6.29.5
 # Modeling
 xgboost==2.1.1
 torch==2.4.1
+
+# Dashboard
+streamlit==1.40.0
+plotly==5.24.1
