@@ -1,417 +1,362 @@
 """
-Comprehensive evaluation script for ADR prediction models
+Evaluation script for ADR prediction models.
+
+Supports MLP, ResNet, Attention, and EmbeddingMLP. Pass --model to select
+which model to evaluate, and --dataset to select the processed data directory.
+
+Usage:
+    python src/evaluate.py --model mlp
+    python src/evaluate.py --model resnet --dataset min1000_expanded
+    python src/evaluate.py --model attention --dataset min1000_expanded
+    python src/evaluate.py --model embedding --dataset min1000_expanded
+    python src/evaluate.py --model all                  # mlp, resnet, attention only
 """
 
 import sys
 import os
+import argparse
+import json
+import pickle
 from pathlib import Path
 
-# Add parent directory to path for imports
-# Allows direct script execution without installing as a package.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import torch
 import pandas as pd
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend — prevents plt.show() from blocking
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import (
     roc_auc_score, average_precision_score, f1_score,
     precision_recall_curve, roc_curve, confusion_matrix,
-    classification_report
+    classification_report,
 )
-from torch.utils.data import DataLoader
-import json
+from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-# Import local modules
 try:
-    from models import get_model
-    from train import ADRDataset, Trainer, get_best_device
+    from models import get_model, EmbeddingMLP
+    from train import ADRDataset, get_best_device
 except ImportError:
     print("Error: models.py or train.py not found in the same directory")
-    print("Please ensure all files are in the src/ directory")
     sys.exit(1)
 
 
-def plot_roc_curves(results_dict, save_path=None):
-    """Plot ROC curves for all models"""
-    # Shared comparison plot makes cross-model operating characteristics obvious.
-    plt.figure(figsize=(10, 8))
-    
-    for model_name, metrics in results_dict.items():
-        fpr, tpr = metrics['fpr'], metrics['tpr']
-        auc = metrics['auroc']
-        plt.plot(fpr, tpr, label=f'{model_name.upper()} (AUC = {auc:.3f})', linewidth=2)
-    
-    plt.plot([0, 1], [0, 1], 'k--', label='Random', linewidth=1)
-    plt.xlabel('False Positive Rate', fontsize=12)
-    plt.ylabel('True Positive Rate', fontsize=12)
-    plt.title('ROC Curves - ADR Prediction', fontsize=14, fontweight='bold')
-    plt.legend(loc='lower right', fontsize=10)
-    plt.grid(alpha=0.3)
-    
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"ROC curves saved to {save_path}")
-    plt.show()
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+EMBED_COLS   = ["drug_encoded", "route_encoded", "dose_unit_rx_encoded"]
+
+DATASET_DIRS = {
+    "base":             PROJECT_ROOT / "processed_data",
+    "min1000":          PROJECT_ROOT / "processed_data_min1000_private",
+    "expanded":         PROJECT_ROOT / "processed_data_expanded",
+    "min1000_expanded": PROJECT_ROOT / "processed_data_min1000_expanded",
+}
 
 
-def plot_pr_curves(results_dict, save_path=None):
-    """Plot Precision-Recall curves for all models"""
-    # PR curves are especially useful for imbalanced ADR detection tasks.
-    plt.figure(figsize=(10, 8))
-    
-    for model_name, metrics in results_dict.items():
-        precision, recall = metrics['precision'], metrics['recall']
-        auprc = metrics['auprc']
-        plt.plot(recall, precision, label=f'{model_name.upper()} (AUPRC = {auprc:.3f})', linewidth=2)
-    
-    plt.xlabel('Recall', fontsize=12)
-    plt.ylabel('Precision', fontsize=12)
-    plt.title('Precision-Recall Curves - ADR Prediction', fontsize=14, fontweight='bold')
-    plt.legend(loc='upper right', fontsize=10)
-    plt.grid(alpha=0.3)
-    
+class EmbeddingADRDataset(Dataset):
+    """Splits feature columns into embedding indices and numerical features."""
+
+    def __init__(self, X: pd.DataFrame, y: pd.DataFrame):
+        self.drug_idx      = torch.LongTensor(X["drug_encoded"].values)
+        self.route_idx     = torch.LongTensor(X["route_encoded"].values)
+        self.dose_unit_idx = torch.LongTensor(X["dose_unit_rx_encoded"].values)
+        num_cols = [c for c in X.columns if c not in EMBED_COLS]
+        self.numerical = torch.FloatTensor(X[num_cols].values)
+        y_arr = y.values if hasattr(y, "values") else y
+        self.y = torch.FloatTensor(y_arr.flatten()).unsqueeze(1)
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return (
+            self.drug_idx[idx],
+            self.route_idx[idx],
+            self.dose_unit_idx[idx],
+            self.numerical[idx],
+            self.y[idx],
+        )
+
+
+def calculate_metrics_at_thresholds(y_true, y_proba, thresholds=(0.3, 0.5, 0.7)):
+    results = {}
+    for threshold in thresholds:
+        y_pred = (y_proba >= threshold).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+        results[threshold] = {
+            "sensitivity": tp / (tp + fn) if (tp + fn) > 0 else 0.0,
+            "specificity": tn / (tn + fp) if (tn + fp) > 0 else 0.0,
+            "precision":   tp / (tp + fp) if (tp + fp) > 0 else 0.0,
+            "f1":          float(f1_score(y_true, y_pred)),
+            "tp": int(tp), "tn": int(tn), "fp": int(fp), "fn": int(fn),
+        }
+    return results
+
+
+def run_inference_standard(model, test_loader, device):
+    """Run inference for MLP / ResNet / Attention (single-tensor forward pass)."""
+    model.eval()
+    all_preds, all_targets = [], []
+    with torch.no_grad():
+        for X_batch, y_batch in tqdm(test_loader, desc="Predicting"):
+            out = model(X_batch.to(device))
+            all_preds.extend(torch.sigmoid(out).cpu().numpy())
+            all_targets.extend(y_batch.numpy())
+    return np.array(all_preds).flatten(), np.array(all_targets).flatten()
+
+
+def run_inference_embedding(model, test_loader, device):
+    """Run inference for EmbeddingMLP (four-input forward pass)."""
+    model.eval()
+    all_preds, all_targets = [], []
+    with torch.no_grad():
+        for d_idx, r_idx, du_idx, numerical, y_batch in tqdm(test_loader, desc="Predicting"):
+            d_idx, r_idx, du_idx = d_idx.to(device), r_idx.to(device), du_idx.to(device)
+            out = model(d_idx, r_idx, du_idx, numerical.to(device))
+            all_preds.extend(torch.sigmoid(out).cpu().numpy())
+            all_targets.extend(y_batch.numpy())
+    return np.array(all_preds).flatten(), np.array(all_targets).flatten()
+
+
+def plot_roc_curve(fpr, tpr, auroc, model_name, save_path=None):
+    plt.figure(figsize=(8, 6))
+    plt.plot(fpr, tpr, label=f"{model_name} (AUC={auroc:.3f})", linewidth=2)
+    plt.plot([0, 1], [0, 1], "k--")
+    plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate")
+    plt.title(f"ROC Curve — {model_name}", fontweight="bold")
+    plt.legend(); plt.grid(alpha=0.3)
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"PR curves saved to {save_path}")
-    plt.show()
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        print(f"ROC curve saved to {save_path}")
+    plt.close()
+
+
+def plot_pr_curve(precision, recall, auprc, model_name, save_path=None):
+    plt.figure(figsize=(8, 6))
+    plt.plot(recall, precision, label=f"{model_name} (AUPRC={auprc:.3f})", linewidth=2)
+    plt.xlabel("Recall"); plt.ylabel("Precision")
+    plt.title(f"Precision-Recall Curve — {model_name}", fontweight="bold")
+    plt.legend(); plt.grid(alpha=0.3)
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        print(f"PR curve saved to {save_path}")
+    plt.close()
 
 
 def plot_confusion_matrix(y_true, y_pred, model_name, save_path=None):
-    """Plot confusion matrix"""
-    # Confusion matrix is threshold-dependent (here based on chosen predictions).
     cm = confusion_matrix(y_true, y_pred)
-    
     plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                xticklabels=['No ADR', 'ADR'],
-                yticklabels=['No ADR', 'ADR'])
-    plt.ylabel('True Label', fontsize=12)
-    plt.xlabel('Predicted Label', fontsize=12)
-    plt.title(f'Confusion Matrix - {model_name.upper()}', fontsize=14, fontweight='bold')
-    
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=["No ADR", "ADR"], yticklabels=["No ADR", "ADR"])
+    plt.ylabel("True Label"); plt.xlabel("Predicted Label")
+    plt.title(f"Confusion Matrix — {model_name}", fontweight="bold")
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
         print(f"Confusion matrix saved to {save_path}")
-    plt.show()
+    plt.close()
 
 
 def plot_training_history(history, model_name, save_path=None):
-    """Plot training history"""
-    # Plot all tracked train/val metrics in one figure for overfitting checks.
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    
-    # Loss
-    axes[0].plot(history['train_loss'], label='Train Loss', linewidth=2)
-    axes[0].plot(history['val_loss'], label='Val Loss', linewidth=2)
-    axes[0].set_xlabel('Epoch', fontsize=12)
-    axes[0].set_ylabel('Loss', fontsize=12)
-    axes[0].set_title('Training Loss', fontsize=12, fontweight='bold')
-    axes[0].legend()
-    axes[0].grid(alpha=0.3)
-    
-    # AUROC
-    axes[1].plot(history['train_auroc'], label='Train AUROC', linewidth=2)
-    axes[1].plot(history['val_auroc'], label='Val AUROC', linewidth=2)
-    axes[1].set_xlabel('Epoch', fontsize=12)
-    axes[1].set_ylabel('AUROC', fontsize=12)
-    axes[1].set_title('AUROC Score', fontsize=12, fontweight='bold')
-    axes[1].legend()
-    axes[1].grid(alpha=0.3)
-    
-    # AUPRC
-    axes[2].plot(history['train_auprc'], label='Train AUPRC', linewidth=2)
-    axes[2].plot(history['val_auprc'], label='Val AUPRC', linewidth=2)
-    axes[2].set_xlabel('Epoch', fontsize=12)
-    axes[2].set_ylabel('AUPRC', fontsize=12)
-    axes[2].set_title('AUPRC Score', fontsize=12, fontweight='bold')
-    axes[2].legend()
-    axes[2].grid(alpha=0.3)
-    
-    plt.suptitle(f'{model_name.upper()} Training History', fontsize=14, fontweight='bold', y=1.02)
+    _, axes = plt.subplots(1, 3, figsize=(18, 5))
+    for ax, metric, label in zip(axes,
+                                  ["loss", "auroc", "auprc"],
+                                  ["Loss", "AUROC", "AUPRC"]):
+        ax.plot(history[f"train_{metric}"], label=f"Train {label}", linewidth=2)
+        ax.plot(history[f"val_{metric}"],   label=f"Val {label}",   linewidth=2)
+        ax.set_xlabel("Epoch"); ax.set_ylabel(label)
+        ax.set_title(f"Training {label}", fontweight="bold")
+        ax.legend(); ax.grid(alpha=0.3)
+    plt.suptitle(f"{model_name} Training History", fontweight="bold", y=1.02)
     plt.tight_layout()
-    
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
         print(f"Training history saved to {save_path}")
-    plt.show()
+    plt.close()
 
 
-def calculate_metrics_at_thresholds(y_true, y_proba, thresholds=[0.3, 0.5, 0.7]):
-    """Calculate metrics at different thresholds"""
-    # Return per-threshold operating point stats for decision support.
-    results = {}
-    
-    for threshold in thresholds:
-        y_pred = (y_proba >= threshold).astype(int)
-        
-        # Calculate metrics
-        tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
-        
-        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-        f1 = f1_score(y_true, y_pred)
-        
-        results[threshold] = {
-            'sensitivity': sensitivity,
-            'specificity': specificity,
-            'precision': precision,
-            'f1': f1,
-            'tp': int(tp), 'tn': int(tn), 'fp': int(fp), 'fn': int(fn)
+def evaluate_single_model(model_name, data_dir, models_dir, results_dir, device,
+                           exclude_cols=None):
+    """Load, run inference, compute metrics, and save results for one model."""
+    exclude_cols = exclude_cols or []
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'='*80}")
+    print(f"Evaluating {model_name.upper()}")
+    print(f"{'='*80}")
+
+    # --- Load test data ---
+    X_test = pd.read_csv(data_dir / "X_test.csv")
+    y_test = pd.read_csv(data_dir / "y_test.csv")
+    if exclude_cols:
+        X_test = X_test.drop(columns=[c for c in exclude_cols if c in X_test.columns])
+    print(f"Test set: {X_test.shape}  ADR rate: {y_test.values.mean():.3f}")
+
+    is_embedding = (model_name == "embedding")
+
+    if is_embedding:
+        # --- EmbeddingMLP ---
+        encoders_path = data_dir / "label_encoders.pkl"
+        if not encoders_path.exists():
+            raise FileNotFoundError(f"Missing label_encoders.pkl in {data_dir}")
+        with open(encoders_path, "rb") as f:
+            encoders = pickle.load(f)
+
+        num_drugs      = len(encoders["drug"].classes_)
+        num_routes     = len(encoders["route"].classes_)
+        num_dose_units = len(encoders["dose_unit_rx"].classes_)
+        num_numerical  = len([c for c in X_test.columns if c not in EMBED_COLS])
+
+        model = EmbeddingMLP(
+            num_drugs=num_drugs, num_routes=num_routes, num_dose_units=num_dose_units,
+            embedding_dim=128, numerical_features=num_numerical,
+            hidden_dims=[256, 128, 64], dropout_rate=0.3,
+        ).to(device)
+
+        model_path = models_dir / "embedding_mlp_best.pth"
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model not found: {model_path}")
+        ckpt = torch.load(model_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+
+        test_loader = DataLoader(
+            EmbeddingADRDataset(X_test, y_test),
+            batch_size=1024, shuffle=False, num_workers=0,
+        )
+        y_proba, y_true = run_inference_embedding(model, test_loader, device)
+
+    else:
+        # --- MLP / ResNet / Attention ---
+        model_configs = {
+            "mlp":       dict(input_dim=X_test.shape[1], hidden_dims=[256, 128, 64, 32], dropout_rate=0.3),
+            "resnet":    dict(input_dim=X_test.shape[1], hidden_dim=256, num_blocks=3,   dropout_rate=0.3),
+            "attention": dict(input_dim=X_test.shape[1], hidden_dims=[256, 128],         dropout_rate=0.3),
         }
-    
-    return results
+        if model_name not in model_configs:
+            raise ValueError(f"Unknown model '{model_name}'. Choose from: mlp, resnet, attention, embedding")
 
+        model = get_model(model_name, **model_configs[model_name]).to(device)
 
-def evaluate_model(model, test_loader, device, model_name):
-    """Comprehensive model evaluation"""
-    # Keep model in eval mode so dropout/batchnorm behavior is deterministic.
-    model.eval()
-    all_preds = []
-    all_targets = []
-    
-    print(f"\nEvaluating {model_name.upper()}...")
-    with torch.no_grad():
-        for X_batch, y_batch in tqdm(test_loader, desc='Predicting'):
-            X_batch = X_batch.to(device)
-            outputs = model(X_batch)
-            all_preds.extend(torch.sigmoid(outputs).cpu().numpy())
-            all_targets.extend(y_batch.numpy())
-    
-    y_true = np.array(all_targets).flatten()
-    y_proba = np.array(all_preds).flatten()
-    
-    # Global ranking metrics (threshold-free).
+        model_path = models_dir / f"{model_name}_best.pth"
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model not found: {model_path}")
+        ckpt = torch.load(model_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+
+        test_loader = DataLoader(
+            ADRDataset(X_test, y_test),
+            batch_size=1024, shuffle=False, num_workers=0,
+        )
+        y_proba, y_true = run_inference_standard(model, test_loader, device)
+
+    # --- Metrics ---
     auroc = roc_auc_score(y_true, y_proba)
     auprc = average_precision_score(y_true, y_proba)
-    
-    # ROC curve
-    fpr, tpr, _ = roc_curve(y_true, y_proba)
-    
-    # PR curve
+    fpr, tpr, _         = roc_curve(y_true, y_proba)
     precision, recall, _ = precision_recall_curve(y_true, y_proba)
-    
-    # Metrics at different thresholds
-    threshold_metrics = calculate_metrics_at_thresholds(y_true, y_proba)
-    
-    # Binary predictions for a standard baseline operating point.
-    y_pred_default = (y_proba >= 0.5).astype(int)
-    
-    results = {
-        'auroc': auroc,
-        'auprc': auprc,
-        'fpr': fpr,
-        'tpr': tpr,
-        'precision': precision,
-        'recall': recall,
-        'y_true': y_true,
-        'y_proba': y_proba,
-        'y_pred_default': y_pred_default,
-        'threshold_metrics': threshold_metrics
+    threshold_metrics   = calculate_metrics_at_thresholds(y_true, y_proba)
+    y_pred              = (y_proba >= 0.5).astype(int)
+
+    # --- Print ---
+    print(f"\nAUROC: {auroc:.4f}  AUPRC: {auprc:.4f}")
+    print(f"\n{'Threshold':<12} {'Sensitivity':<14} {'Specificity':<14} {'Precision':<12} F1")
+    for t, m in threshold_metrics.items():
+        print(f"{t:<12.1f} {m['sensitivity']:<14.4f} {m['specificity']:<14.4f} "
+              f"{m['precision']:<12.4f} {m['f1']:.4f}")
+    print(f"\nClassification Report (threshold=0.5):")
+    print(classification_report(y_true, y_pred, target_names=["No ADR", "ADR"], digits=4))
+
+    # --- Plots ---
+    plot_roc_curve(fpr, tpr, auroc, model_name,
+                   save_path=results_dir / f"{model_name}_roc_curve.png")
+    plot_pr_curve(precision, recall, auprc, model_name,
+                  save_path=results_dir / f"{model_name}_pr_curve.png")
+    plot_confusion_matrix(y_true, y_pred, model_name,
+                          save_path=results_dir / f"{model_name}_confusion_matrix.png")
+
+    history_path = models_dir / f"{model_name}_history.json"
+    if history_path.exists():
+        with open(history_path) as f:
+            history = json.load(f)
+        plot_training_history(history, model_name,
+                              save_path=results_dir / f"{model_name}_training_history.png")
+
+    # --- Save JSON ---
+    output = {
+        "model":    model_name,
+        "dataset":  str(data_dir),
+        "auroc":    float(auroc),
+        "auprc":    float(auprc),
+        "threshold_metrics": {
+            str(k): {kk: float(vv) for kk, vv in v.items() if kk not in ("tp","tn","fp","fn")}
+            for k, v in threshold_metrics.items()
+        },
     }
-    
-    return results
+    with open(results_dir / f"{model_name}_evaluation.json", "w") as f:
+        json.dump(output, f, indent=2)
+    print(f"\nResults saved to {results_dir}")
 
-
-def print_evaluation_report(results_dict):
-    """Print comprehensive evaluation report"""
-    print("\n" + "="*80)
-    print("MODEL EVALUATION REPORT")
-    print("="*80)
-    
-    # Summary table
-    print("\nOverall Performance:")
-    print("-" * 80)
-    print(f"{'Model':<15} {'AUROC':<10} {'AUPRC':<10} {'F1@0.5':<10} {'Sens@0.5':<12} {'Spec@0.5':<12}")
-    print("-" * 80)
-    
-    for model_name, metrics in results_dict.items():
-        threshold_metrics = metrics['threshold_metrics'][0.5]
-        print(f"{model_name.upper():<15} "
-              f"{metrics['auroc']:<10.4f} "
-              f"{metrics['auprc']:<10.4f} "
-              f"{threshold_metrics['f1']:<10.4f} "
-              f"{threshold_metrics['sensitivity']:<12.4f} "
-              f"{threshold_metrics['specificity']:<12.4f}")
-    
-    # Detailed section for best AUROC model.
-    best_model = max(results_dict.items(), key=lambda x: x[1]['auroc'])
-    model_name, metrics = best_model
-    
-    print(f"\n{'='*80}")
-    print(f"BEST MODEL: {model_name.upper()}")
-    print(f"{'='*80}")
-    
-    print("\nPerformance at Different Thresholds:")
-    print("-" * 80)
-    print(f"{'Threshold':<12} {'Precision':<12} {'Recall':<12} {'F1':<10} {'Specificity':<12}")
-    print("-" * 80)
-    
-    for threshold, threshold_metrics in metrics['threshold_metrics'].items():
-        print(f"{threshold:<12.1f} "
-              f"{threshold_metrics['precision']:<12.4f} "
-              f"{threshold_metrics['sensitivity']:<12.4f} "
-              f"{threshold_metrics['f1']:<10.4f} "
-              f"{threshold_metrics['specificity']:<12.4f}")
-    
-    print("\nClassification Report (Threshold = 0.5):")
-    print("-" * 80)
-    print(classification_report(
-        metrics['y_true'], 
-        metrics['y_pred_default'],
-        target_names=['No ADR', 'ADR'],
-        digits=4
-    ))
+    return output
 
 
 def main():
-    """Main evaluation pipeline"""
-    
-    # Configuration
-    # Resolve directories from repository root so this script is portable.
-    PROJECT_ROOT = Path(__file__).resolve().parents[1]
-    DATA_DIR = PROJECT_ROOT / "processed_data"
-    MODELS_DIR = PROJECT_ROOT / "models"
-    RESULTS_DIR = PROJECT_ROOT / "results"
-    
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    
-    device = get_best_device()
-    BATCH_SIZE = 1024
-    
-    print("="*80)
-    print("ADR Prediction Model Evaluation")
-    print("="*80)
-    print(f"Selected device: {device}")
-    
-    # Load test data
-    print("\n[1/4] Loading test data...")
-    required_inputs = [
-        DATA_DIR / "X_test.csv",
-        DATA_DIR / "y_test.csv",
-    ]
-    missing_inputs = [str(path) for path in required_inputs if not path.exists()]
-    if missing_inputs:
-        raise FileNotFoundError(
-            "Missing required input files:\n- " + "\n- ".join(missing_inputs)
-        )
+    parser = argparse.ArgumentParser(description="Evaluate ADR prediction models")
+    parser.add_argument("--model", default="all",
+                        choices=["mlp", "resnet", "attention", "embedding", "all"],
+                        help="Model to evaluate (default: all = mlp+resnet+attention)")
+    parser.add_argument("--dataset", default="base",
+                        choices=list(DATASET_DIRS),
+                        help="Processed dataset to evaluate on (default: base)")
+    parser.add_argument("--models-dir", default=None,
+                        help="Directory containing saved model .pth files (default: models/)")
+    parser.add_argument("--results-dir", default=None,
+                        help="Directory to save evaluation outputs (default: results/)")
+    parser.add_argument("--exclude", nargs="*", default=[],
+                        metavar="COL",
+                        help="Feature columns to exclude before evaluation")
+    args = parser.parse_args()
 
-    X_test = pd.read_csv(DATA_DIR / "X_test.csv")
-    y_test = pd.read_csv(DATA_DIR / "y_test.csv")
-    
-    print(f"Test set: {X_test.shape}")
-    print(f"ADR rate: {y_test.mean().values[0]:.3f}")
-    
-    # Create test dataset
-    # Reuses ADRDataset to guarantee identical tensor conversion semantics.
-    test_dataset = ADRDataset(X_test, y_test)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
-    
-    # Evaluate all models
-    print("\n[2/4] Evaluating models...")
-    
-    models_to_eval = {
-        'mlp': {
-            'model_type': 'mlp',
-            'input_dim': X_test.shape[1],
-            'hidden_dims': [256, 128, 64, 32],
-            'dropout_rate': 0.3
-        },
-        'resnet': {
-            'model_type': 'resnet',
-            'input_dim': X_test.shape[1],
-            'hidden_dim': 256,
-            'num_blocks': 3,
-            'dropout_rate': 0.3
-        },
-        'attention': {
-            'model_type': 'attention',
-            'input_dim': X_test.shape[1],
-            'hidden_dims': [256, 128],
-            'dropout_rate': 0.3
-        }
-    }
-    
-    evaluation_results = {}
-    
-    for model_name, config in models_to_eval.items():
-        # Load model
-        model_path = MODELS_DIR / f"{model_name}_best.pth"
-        
-        if not model_path.exists():
-            # Skip missing checkpoints rather than failing entire evaluation pass.
-            print(f"Model not found: {model_path}. Skipping...")
-            continue
-        
-        model_type = config.pop('model_type')
-        model = get_model(model_type, **config)
-        
-        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.to(device)
-        
-        # Evaluate
-        results = evaluate_model(model, test_loader, device, model_name)
-        evaluation_results[model_name] = results
-        
-        # Plot training history
-        # Histories are optional (e.g., if training was interrupted or files removed).
-        history_path = MODELS_DIR / f"{model_name}_history.json"
-        if history_path.exists():
-            with open(history_path, 'r') as f:
-                history = json.load(f)
-            plot_training_history(
-                history, 
-                model_name, 
-                save_path=RESULTS_DIR / f"{model_name}_training_history.png"
+    data_dir    = DATASET_DIRS[args.dataset]
+    models_dir  = Path(args.models_dir) if args.models_dir else PROJECT_ROOT / "models"
+    results_dir = Path(args.results_dir) if args.results_dir else PROJECT_ROOT / "results"
+    device      = get_best_device()
+
+    print("=" * 80)
+    print("ADR Prediction Model Evaluation")
+    print("=" * 80)
+    print(f"Dataset:    {data_dir}")
+    print(f"Models dir: {models_dir}")
+    print(f"Device:     {device}")
+
+    models_to_run = (
+        ["mlp", "resnet", "attention"] if args.model == "all" else [args.model]
+    )
+
+    all_results = {}
+    for model_name in models_to_run:
+        try:
+            result = evaluate_single_model(
+                model_name, data_dir, models_dir, results_dir, device,
+                exclude_cols=args.exclude,
             )
-        
-        # Plot confusion matrix
-        plot_confusion_matrix(
-            results['y_true'],
-            results['y_pred_default'],
-            model_name,
-            save_path=RESULTS_DIR / f"{model_name}_confusion_matrix.png"
-        )
-    
-    # Generate comparison plots
-    print("\n[3/4] Generating comparison plots...")
-    plot_roc_curves(evaluation_results, save_path=RESULTS_DIR / "roc_curves_comparison.png")
-    plot_pr_curves(evaluation_results, save_path=RESULTS_DIR / "pr_curves_comparison.png")
-    
-    # Print evaluation report
-    print("\n[4/4] Generating evaluation report...")
-    print_evaluation_report(evaluation_results)
-    
-    # Save results
-    # Serialize to plain Python floats for JSON compatibility.
-    results_summary = {}
-    for model_name, metrics in evaluation_results.items():
-        results_summary[model_name] = {
-            'auroc': float(metrics['auroc']),
-            'auprc': float(metrics['auprc']),
-            'threshold_metrics': {
-                str(k): {
-                    'sensitivity': float(v['sensitivity']),
-                    'specificity': float(v['specificity']),
-                    'precision': float(v['precision']),
-                    'f1': float(v['f1'])
-                }
-                for k, v in metrics['threshold_metrics'].items()
-            }
-        }
-    
-    with open(RESULTS_DIR / "evaluation_results.json", 'w') as f:
-        json.dump(results_summary, f, indent=2)
-    
-    print("\n" + "="*80)
-    print(f"Evaluation complete! Results saved to: {RESULTS_DIR}")
-    print("="*80)
+            all_results[model_name] = result
+        except FileNotFoundError as e:
+            print(f"Skipping {model_name}: {e}")
+
+    if len(all_results) > 1:
+        print("\n" + "=" * 80)
+        print("SUMMARY")
+        print("=" * 80)
+        print(f"{'Model':<12} {'AUROC':<10} {'AUPRC':<10} {'Sens@0.5':<12} {'Spec@0.5':<12} F1@0.5")
+        for name, r in all_results.items():
+            t = r["threshold_metrics"]["0.5"]
+            print(f"{name:<12} {r['auroc']:<10.4f} {r['auprc']:<10.4f} "
+                  f"{t['sensitivity']:<12.4f} {t['specificity']:<12.4f} {t['f1']:.4f}")
+
+    print("\n" + "=" * 80)
+    print("Evaluation complete.")
+    print("=" * 80)
 
 
 if __name__ == "__main__":
