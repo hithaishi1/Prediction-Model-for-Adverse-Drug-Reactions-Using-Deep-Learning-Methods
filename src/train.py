@@ -25,7 +25,7 @@ import random
 
 # Import models
 try:
-    from models import get_model, FocalLoss
+    from models import get_model, FocalLoss, DeepEnsemble
 except ImportError:
     print("Error: models.py not found in the same directory as train.py")
     print("Please ensure models.py is in the src/ directory")
@@ -273,7 +273,7 @@ class Trainer:
         """Create a ReduceLROnPlateau scheduler compatible across torch versions."""
         try:
             return optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer, mode='max', factor=0.5, patience=5, verbose=True
+                self.optimizer, mode='max', factor=0.5, patience=5
             )
         except TypeError:
             return optim.lr_scheduler.ReduceLROnPlateau(
@@ -456,6 +456,10 @@ def main():
             early_stopping_patience=EARLY_STOPPING_PATIENCE
         )
 
+        # Save pre-fine-tuning model
+        model_path = MODELS_DIR / f"{model_name}_best.pth"
+        trainer.save_model(model_path)
+
         # Optional second-phase fine-tuning at lower learning rate.
         if ENABLE_FINE_TUNING:
             fine_tune_lr = LEARNING_RATE * FINE_TUNE_LR_FACTOR
@@ -467,18 +471,17 @@ def main():
                 epochs=FINE_TUNE_EPOCHS,
                 early_stopping_patience=FINE_TUNE_PATIENCE
             )
-        
-        # Save model
-        model_path = MODELS_DIR / f"{model_name}_best.pth"
-        trainer.save_model(model_path)
-        
+            # Save fine-tuned model separately
+            model_path = MODELS_DIR / f"{model_name}_finetuned.pth"
+            trainer.save_model(model_path)
+
         # Store results
         results[model_name] = {
             'best_val_auroc': max(history['val_auroc']),
             'best_val_auprc': max(history['val_auprc']),
             'history': history
         }
-        
+
         # Save history
         # Per-model history file drives later plotting in evaluation script.
         with open(MODELS_DIR / f"{model_name}_history.json", 'w') as f:
@@ -499,11 +502,71 @@ def main():
             k: {
                 'best_val_auroc': v['best_val_auroc'],
                 'best_val_auprc': v['best_val_auprc']
-            } 
+            }
             for k, v in results.items()
         }
         json.dump(results_serializable, f, indent=2)
-    
+
+    # Build and save Ensemble from the three trained models
+    print("\n" + "="*80)
+    print("[5b/6] Building Ensemble...")
+    print("="*80)
+
+    sub_models = []
+    ensemble_configs = {
+        'mlp': {
+            'input_dim': X_train.shape[1],
+            'hidden_dims': [256, 128, 64, 32],
+            'dropout_rate': 0.3
+        },
+        'resnet': {
+            'input_dim': X_train.shape[1],
+            'hidden_dim': 256,
+            'num_blocks': 3,
+            'dropout_rate': 0.3
+        },
+        'attention': {
+            'input_dim': X_train.shape[1],
+            'hidden_dims': [256, 128],
+            'dropout_rate': 0.3
+        }
+    }
+
+    for model_name, config in ensemble_configs.items():
+        model_path = MODELS_DIR / f"{model_name}_best.pth"
+        if not model_path.exists():
+            print(f"  Skipping ensemble — missing {model_path}")
+            break
+        m = get_model(model_name, **config).to(device)
+        ckpt = torch.load(model_path, map_location=device, weights_only=False)
+        m.load_state_dict(ckpt['model_state_dict'])
+        m.eval()
+        sub_models.append(m)
+    else:
+        ensemble = DeepEnsemble(sub_models).to(device)
+        ensemble.eval()
+
+        # Evaluate on val set
+        all_preds, all_targets = [], []
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                out = ensemble(X_batch.to(device))
+                all_preds.extend(torch.sigmoid(out).cpu().numpy())
+                all_targets.extend(y_batch.numpy())
+
+        val_auroc = roc_auc_score(all_targets, all_preds)
+        val_auprc = average_precision_score(all_targets, all_preds)
+        print(f"Ensemble val AUROC: {val_auroc:.4f}  val AUPRC: {val_auprc:.4f}")
+
+        ensemble_path = MODELS_DIR / "ensemble_best.pth"
+        torch.save({'model_state_dict': ensemble.state_dict()}, ensemble_path)
+        print(f"Ensemble saved to {ensemble_path}")
+
+        results['ensemble'] = {
+            'best_val_auroc': float(val_auroc),
+            'best_val_auprc': float(val_auprc),
+        }
+
     print("\n" + "="*80)
     print("[6/6] Training complete!")
     print(f"Models saved to: {MODELS_DIR}")
