@@ -15,12 +15,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import torch
-from sklearn.metrics import (
-    average_precision_score,
-    precision_recall_curve,
-    roc_auc_score,
-    roc_curve,
-)
 
 # ── paths ────────────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -91,6 +85,7 @@ def load_preprocessors():
     return encoders, scaler, feat_names
 
 
+
 @st.cache_resource
 def load_dl_model(model_name: str, input_dim: int):
     cfg = {
@@ -117,24 +112,25 @@ def load_dl_model(model_name: str, input_dim: int):
 
 @st.cache_data
 def load_results():
-    paths = {
-        "baseline_metrics": RESULTS_DIR / "baseline_models_metrics.csv",
-        "deep_metrics":     RESULTS_DIR / "deep_models_metrics.csv",
-        "combined":         RESULTS_DIR / "combined_model_metrics.csv",
-        "baseline_preds":   RESULTS_DIR / "best_baseline_test_predictions.csv",
-        "deep_preds":       RESULTS_DIR / "deep_models_test_predictions.json",
-        "threshold":        RESULTS_DIR / "model_threshold_metrics.csv",
-    }
-    out = {}
-    for k, p in paths.items():
-        if not p.exists():
-            continue
-        if p.suffix == ".csv":
-            out[k] = pd.read_csv(p)
-        else:
-            with open(p) as f:
-                out[k] = json.load(f)
-    return out
+    """Load metrics from results_summary.csv."""
+    summary_csv = PROJECT_ROOT / "results_summary.csv"
+    if not summary_csv.exists():
+        return {}
+
+    df = pd.read_csv(summary_csv)
+    df = df.rename(columns={
+        "features":    "Features",
+        "model":       "Model",
+        "type":        "Type",
+        "auroc":       "AUROC",
+        "auprc":       "AUPRC",
+        "sensitivity": "Sensitivity",
+        "specificity": "Specificity",
+        "precision":   "Precision",
+        "f1":          "F1",
+    })
+    df = df.sort_values("AUROC", ascending=False).reset_index(drop=True)
+    return {"summary": df}
 
 
 @st.cache_data
@@ -152,7 +148,11 @@ def load_test_data():
     yp = DATA_DIR / "y_test.csv"
     if not (xp.exists() and yp.exists()):
         return None, None
-    return pd.read_csv(xp), pd.read_csv(yp)
+    X = pd.read_csv(xp)
+    # Add risk_score if missing (backwards compatibility with old flat MLP checkpoint)
+    if "risk_score" not in X.columns and "anchor_age" in X.columns and "patient_prescription_count" in X.columns:
+        X["risk_score"] = X["anchor_age"] / 100 + np.log1p(X["patient_prescription_count"]) / 10
+    return X, pd.read_csv(yp)
 
 
 def encode_input(row: dict, encoders, scaler, feat_names: list) -> np.ndarray | None:
@@ -198,13 +198,14 @@ def encode_input(row: dict, encoders, scaler, feat_names: list) -> np.ndarray | 
         vec = np.array([[feat[k] for k in ordered]], dtype=np.float32)
 
         num_cols = ["anchor_age","dose_val_rx","log_dose","treatment_duration_hours",
-                    "drug_frequency","patient_admission_count","patient_prescription_count","risk_score"]
+                    "drug_frequency","patient_admission_count","patient_prescription_count"]
         num_idx  = [ordered.index(c) for c in num_cols if c in ordered]
         vec[0, num_idx] = scaler.transform(vec[:, num_idx])[0]
         return vec
     except Exception as e:
         st.error(f"Feature encoding error: {e}")
         return None
+
 
 
 def risk_badge(prob: float) -> str:
@@ -261,12 +262,9 @@ with st.sidebar:
 # ── load shared assets ────────────────────────────────────────────────────────
 encoders, scaler, feat_names = load_preprocessors()
 results = load_results()
-
-# infer input_dim from test data or feature list
 X_test, y_test = load_test_data()
-input_dim = X_test.shape[1] if X_test is not None else (len(feat_names) if feat_names else 13)
 
-dl_model = load_dl_model(model_choice, input_dim)
+dl_model = load_dl_model(model_choice, input_dim=13)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PAGE 1 — PREDICT ADR
@@ -287,15 +285,15 @@ if page == "🔬 Predict ADR":
 
         with c2:
             st.subheader("💊 Drug")
-            drug  = st.selectbox("Drug", DRUG_OPTIONS)
-            dose  = st.number_input("Dose value", 0.0, 10000.0, 500.0, step=50.0)
+            drug   = st.selectbox("Drug", DRUG_OPTIONS)
+            dose   = st.number_input("Dose value", 0.0, 10000.0, 500.0, step=50.0)
             d_unit = st.selectbox("Dose unit", DOSE_UNIT_OPTIONS)
-            route = st.selectbox("Route", ROUTE_OPTIONS)
+            route  = st.selectbox("Route", ROUTE_OPTIONS)
 
         with c3:
             st.subheader("⏱️ Treatment")
-            dur   = st.number_input("Duration (hours)", 0.0, 720.0, 24.0, step=1.0)
-            freq  = st.number_input("Drug frequency (population)", 100, 100000, 5000, step=100)
+            dur  = st.number_input("Duration (hours)", 0.0, 720.0, 24.0, step=1.0)
+            freq = st.number_input("Drug frequency (population)", 100, 100000, 5000, step=100)
             st.markdown("<br>", unsafe_allow_html=True)
             submitted = st.form_submit_button("🚀 Predict ADR Risk", use_container_width=True)
 
@@ -308,37 +306,38 @@ if page == "🔬 Predict ADR":
                        treatment_duration_hours=dur, drug_frequency=freq,
                        patient_admission_count=adm, patient_prescription_count=prx)
             vec = encode_input(row, encoders, scaler, feat_names)
+            prob = None
             if vec is not None:
                 with torch.no_grad():
                     prob = float(torch.sigmoid(dl_model(torch.FloatTensor(vec))).item())
 
+        if prob is not None:
+            st.markdown("---")
+            rc1, rc2 = st.columns([1, 2])
+            with rc1:
+                st.plotly_chart(gauge_chart(prob), use_container_width=True)
+            with rc2:
+                st.markdown("### Risk Assessment")
+                st.markdown(risk_badge(prob), unsafe_allow_html=True)
+                st.markdown("<br>", unsafe_allow_html=True)
+                st.markdown(f"**Drug:** {drug}  |  **Dose:** {dose} {d_unit}  |  **Route:** {route}")
+                st.markdown(f"**Patient:** {gender}, Age {age}  |  **Duration:** {dur}h")
                 st.markdown("---")
-                rc1, rc2 = st.columns([1, 2])
-                with rc1:
-                    st.plotly_chart(gauge_chart(prob), use_container_width=True)
-                with rc2:
-                    st.markdown("### Risk Assessment")
-                    st.markdown(risk_badge(prob), unsafe_allow_html=True)
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    st.markdown(f"**Drug:** {drug}  |  **Dose:** {dose} {d_unit}  |  **Route:** {route}")
-                    st.markdown(f"**Patient:** {gender}, Age {age}  |  **Duration:** {dur}h")
-                    st.markdown("---")
-                    if prob >= 0.6:
-                        st.error("⚠️ High ADR risk detected. Consider alternative medications or dose adjustment.")
-                    elif prob >= 0.35:
-                        st.warning("⚠️ Moderate ADR risk. Monitor patient closely.")
-                    else:
-                        st.success("✅ Low ADR risk based on available patient features.")
+                if prob >= 0.6:
+                    st.error("⚠️ High ADR risk detected. Consider alternative medications or dose adjustment.")
+                elif prob >= 0.35:
+                    st.warning("⚠️ Moderate ADR risk. Monitor patient closely.")
+                else:
+                    st.success("✅ Low ADR risk based on available patient features.")
 
-                    # save to session history
-                    if "history" not in st.session_state:
-                        st.session_state.history = []
-                    st.session_state.history.append({
-                        "Drug": drug, "Age": age, "Sex": gender,
-                        "Dose": f"{dose} {d_unit}", "Route": route,
-                        "Model": model_choice.upper(), "ADR Risk": f"{prob:.1%}",
-                        "Level": "High" if prob>=0.6 else ("Medium" if prob>=0.35 else "Low"),
-                    })
+                if "history" not in st.session_state:
+                    st.session_state.history = []
+                st.session_state.history.append({
+                    "Drug": drug, "Age": age, "Sex": gender,
+                    "Dose": f"{dose} {d_unit}", "Route": route,
+                    "Model": model_choice, "ADR Risk": f"{prob:.1%}",
+                    "Level": "High" if prob>=0.6 else ("Medium" if prob>=0.35 else "Low"),
+                })
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -351,16 +350,15 @@ elif page == "📊 Model Performance":
 
     # ── tab 1: summary metrics ──────────────────────────────────────────────
     with tab1:
-        df = results.get("combined") or results.get("baseline_metrics")
-        if df is not None:
-            # headline KPI cards
-            best = df.sort_values("Test AUROC", ascending=False).iloc[0]
+        summary = results.get("summary")
+        if summary is not None and len(summary) > 0:
+            best = summary.iloc[0]
             k1, k2, k3, k4 = st.columns(4)
             for col, label, val in [
-                (k1, "Best AUROC",  f"{best['Test AUROC']:.4f}"),
-                (k2, "Best AUPRC",  f"{best['Test AUPRC']:.4f}"),
+                (k1, "Best AUROC",  f"{best['AUROC']:.4f}"),
+                (k2, "Best AUPRC",  f"{best['AUPRC']:.4f}"),
                 (k3, "Best Model",  best["Model"]),
-                (k4, "# Models",    str(len(df))),
+                (k4, "# Models",    str(len(summary))),
             ]:
                 col.markdown(
                     f'<div class="metric-card">'
@@ -370,93 +368,77 @@ elif page == "📊 Model Performance":
                 )
             st.markdown("<br>", unsafe_allow_html=True)
 
+            # filters
+            fc1, fc2 = st.columns(2)
+            feat_opts = ["All"] + sorted(summary["Features"].astype(str).unique().tolist())
+            type_opts = ["All"] + sorted(summary["Type"].unique().tolist())
+            sel_feat  = fc1.selectbox("Filter by feature count", feat_opts)
+            sel_type  = fc2.selectbox("Filter by model type", type_opts)
+
+            filtered = summary.copy()
+            if sel_feat != "All": filtered = filtered[filtered["Features"].astype(str) == sel_feat]
+            if sel_type != "All": filtered = filtered[filtered["Type"] == sel_type]
+
             # bar chart
+            plot_df = filtered.sort_values("AUROC").copy()
+            plot_df["Label"] = plot_df["Model"] + " (" + plot_df["Features"].astype(str) + "f)"
             fig = px.bar(
-                df.sort_values("Test AUROC"),
-                x="Test AUROC", y="Model",
-                color="Test AUROC",
-                color_continuous_scale="Viridis",
-                orientation="h",
-                title="Test AUROC by Model",
-                text=df.sort_values("Test AUROC")["Test AUROC"].map("{:.4f}".format),
+                plot_df, x="AUROC", y="Label",
+                color="Features", color_continuous_scale="Viridis",
+                orientation="h", title="AUROC by Model (Test Set)",
+                text=plot_df["AUROC"].map("{:.4f}".format),
+                hover_data={"Features": True, "Type": True, "AUPRC": ":.4f"},
             )
             fig.update_layout(
                 paper_bgcolor="#1e2130", plot_bgcolor="#1e2130",
                 font_color="#fff", coloraxis_showscale=False,
                 margin=dict(l=10, r=10, t=40, b=10),
+                xaxis_range=[0.5, 1.0],
             )
             fig.update_traces(textposition="outside")
             st.plotly_chart(fig, use_container_width=True)
 
             # AUROC vs AUPRC scatter
             fig2 = px.scatter(
-                df, x="Test AUROC", y="Test AUPRC",
-                text="Model", size_max=18,
-                color="Test AUROC", color_continuous_scale="Viridis",
+                plot_df, x="AUROC", y="AUPRC",
+                text="Label", color="Features",
+                symbol="Type", color_continuous_scale="Viridis",
                 title="AUROC vs AUPRC (Test Set)",
             )
-            fig2.update_traces(textposition="top center", marker_size=12)
+            fig2.update_traces(textposition="top center", marker_size=10)
             fig2.update_layout(
                 paper_bgcolor="#1e2130", plot_bgcolor="#1e2130",
                 font_color="#fff", coloraxis_showscale=False,
             )
             st.plotly_chart(fig2, use_container_width=True)
 
-            st.dataframe(df.style.format({
-                "Test AUROC": "{:.4f}", "Test AUPRC": "{:.4f}",
-                "Val AUROC":  "{:.4f}", "Val AUPRC":  "{:.4f}",
-            }), use_container_width=True)
+            st.dataframe(
+                filtered.style.format({"AUROC": "{:.4f}", "AUPRC": "{:.4f}",
+                                       "Sensitivity": "{:.4f}", "Specificity": "{:.4f}",
+                                       "Precision": "{:.4f}", "F1": "{:.4f}"}),
+                use_container_width=True,
+            )
         else:
-            st.info("Run the training notebooks to generate result files.")
+            st.info("No results found. Check that results_summary.csv exists in the project root.")
 
     # ── tab 2: ROC / PR curves ──────────────────────────────────────────────
     with tab2:
-        if X_test is not None and y_test is not None:
-            y_true = y_test.values.flatten()
-            deep_preds = results.get("deep_preds", {})
-            baseline_preds_df = results.get("baseline_preds")
+        # Look for pre-generated curve images in results/
+        roc_paths = sorted((RESULTS_DIR).glob("*roc_curve*.png")) if RESULTS_DIR.exists() else []
+        pr_paths  = sorted((RESULTS_DIR).glob("*pr_curve*.png"))  if RESULTS_DIR.exists() else []
 
-            roc_fig = go.Figure()
-            pr_fig  = go.Figure()
-
-            colors = px.colors.qualitative.Plotly
-
-            # deep models
-            for i, (mname, payload) in enumerate(deep_preds.items()):
-                yp = np.array(payload["y_proba"])
-                yt = np.array(payload["y_true"])
-                fpr, tpr, _ = roc_curve(yt, yp)
-                p, r, _     = precision_recall_curve(yt, yp)
-                auc  = roc_auc_score(yt, yp)
-                aprc = average_precision_score(yt, yp)
-                roc_fig.add_trace(go.Scatter(x=fpr, y=tpr, name=f"{mname.upper()} (AUC={auc:.3f})", line=dict(color=colors[i], width=2)))
-                pr_fig.add_trace( go.Scatter(x=r,   y=p,   name=f"{mname.upper()} (AUPRC={aprc:.3f})", line=dict(color=colors[i], width=2)))
-
-            # best baseline
-            if baseline_preds_df is not None and "y_proba" in baseline_preds_df.columns:
-                yp = baseline_preds_df["y_proba"].values
-                yt = baseline_preds_df["y_true"].values
-                fpr, tpr, _ = roc_curve(yt, yp)
-                p, r, _     = precision_recall_curve(yt, yp)
-                auc  = roc_auc_score(yt, yp)
-                aprc = average_precision_score(yt, yp)
-                roc_fig.add_trace(go.Scatter(x=fpr, y=tpr, name=f"Best Baseline (AUC={auc:.3f})", line=dict(color="gold", width=2, dash="dash")))
-                pr_fig.add_trace( go.Scatter(x=r,   y=p,   name=f"Best Baseline (AUPRC={aprc:.3f})", line=dict(color="gold", width=2, dash="dash")))
-
-            roc_fig.add_trace(go.Scatter(x=[0,1], y=[0,1], name="Random", line=dict(color="gray", dash="dot")))
-
-            for fig_, title_, xlab_, ylab_ in [
-                (roc_fig, "ROC Curves",            "False Positive Rate", "True Positive Rate"),
-                (pr_fig,  "Precision-Recall Curves","Recall",             "Precision"),
-            ]:
-                fig_.update_layout(
-                    title=title_, xaxis_title=xlab_, yaxis_title=ylab_,
-                    paper_bgcolor="#1e2130", plot_bgcolor="#1e2130",
-                    font_color="#fff", legend=dict(bgcolor="#1e2130"),
-                )
-                st.plotly_chart(fig_, use_container_width=True)
+        if roc_paths or pr_paths:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("#### ROC Curves")
+                for p in roc_paths:
+                    st.image(str(p), caption=p.stem, use_container_width=True)
+            with c2:
+                st.markdown("#### Precision-Recall Curves")
+                for p in pr_paths:
+                    st.image(str(p), caption=p.stem, use_container_width=True)
         else:
-            st.info("Test data not found. Run preprocessing.py first.")
+            st.info("No curve images found. Run `python src/evaluate.py --model all` to generate them.")
 
     # ── tab 3: training history ─────────────────────────────────────────────
     with tab3:

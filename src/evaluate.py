@@ -4,12 +4,23 @@ Evaluation script for ADR prediction models.
 Supports MLP, ResNet, Attention, and EmbeddingMLP. Pass --model to select
 which model to evaluate, and --dataset to select the processed data directory.
 
+Calibration
+-----------
+Pass --calibrate to apply temperature scaling after standard evaluation.
+Temperature scaling fits a single scalar T on the validation set by minimizing
+negative log-likelihood, then divides the test-set logits by T before applying
+sigmoid. T > 1 softens predictions (spreads probabilities toward 0.5); T < 1
+sharpens them. This corrects systematic over- or under-confidence without
+retraining and does not change AUROC. Calibrated metrics are printed and saved
+alongside uncalibrated metrics in the results JSON.
+
 Usage:
     python src/evaluate.py --model mlp
     python src/evaluate.py --model resnet --dataset min1000_expanded
     python src/evaluate.py --model attention --dataset min1000_expanded
     python src/evaluate.py --model embedding --dataset min1000_expanded
     python src/evaluate.py --model all                  # mlp, resnet, attention only
+    python src/evaluate.py --model mlp --calibrate      # with temperature scaling
 """
 
 import sys
@@ -18,6 +29,7 @@ import argparse
 import json
 import pickle
 from pathlib import Path
+from scipy.optimize import minimize_scalar
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -95,29 +107,45 @@ def calculate_metrics_at_thresholds(y_true, y_proba, thresholds=(0.3, 0.5, 0.7))
     return results
 
 
-def run_inference_standard(model, test_loader, device):
-    """Run inference for MLP / ResNet / Attention (single-tensor forward pass)."""
+def run_inference_standard(model, loader, device, desc="Predicting"):
+    """Run inference for MLP / ResNet / Attention. Returns (logits, y_true)."""
     model.eval()
-    all_preds, all_targets = [], []
+    all_logits, all_targets = [], []
     with torch.no_grad():
-        for X_batch, y_batch in tqdm(test_loader, desc="Predicting"):
+        for X_batch, y_batch in tqdm(loader, desc=desc):
             out = model(X_batch.to(device))
-            all_preds.extend(torch.sigmoid(out).cpu().numpy())
+            all_logits.extend(out.cpu().numpy())
             all_targets.extend(y_batch.numpy())
-    return np.array(all_preds).flatten(), np.array(all_targets).flatten()
+    return np.array(all_logits).flatten(), np.array(all_targets).flatten()
 
 
-def run_inference_embedding(model, test_loader, device):
-    """Run inference for EmbeddingMLP (four-input forward pass)."""
+def run_inference_embedding(model, loader, device, desc="Predicting"):
+    """Run inference for EmbeddingMLP (four-input forward pass). Returns (logits, y_true)."""
     model.eval()
-    all_preds, all_targets = [], []
+    all_logits, all_targets = [], []
     with torch.no_grad():
-        for d_idx, r_idx, du_idx, numerical, y_batch in tqdm(test_loader, desc="Predicting"):
+        for d_idx, r_idx, du_idx, numerical, y_batch in tqdm(loader, desc=desc):
             d_idx, r_idx, du_idx = d_idx.to(device), r_idx.to(device), du_idx.to(device)
             out = model(d_idx, r_idx, du_idx, numerical.to(device))
-            all_preds.extend(torch.sigmoid(out).cpu().numpy())
+            all_logits.extend(out.cpu().numpy())
             all_targets.extend(y_batch.numpy())
-    return np.array(all_preds).flatten(), np.array(all_targets).flatten()
+    return np.array(all_logits).flatten(), np.array(all_targets).flatten()
+
+
+def find_temperature(logits: np.ndarray, y_true: np.ndarray) -> float:
+    """Find scalar temperature T that minimises NLL on a held-out set.
+
+    Dividing logits by T before sigmoid corrects systematic over/under-confidence.
+    T > 1 softens predictions; T < 1 sharpens them.
+    """
+    from sklearn.metrics import log_loss
+
+    def nll(T):
+        proba = 1.0 / (1.0 + np.exp(-logits / T))
+        return log_loss(y_true, proba)
+
+    result = minimize_scalar(nll, bounds=(0.01, 20.0), method="bounded")
+    return float(result.x)
 
 
 def plot_roc_curve(fpr, tpr, auroc, model_name, save_path=None):
@@ -177,8 +205,12 @@ def plot_training_history(history, model_name, save_path=None):
 
 
 def evaluate_single_model(model_name, data_dir, models_dir, results_dir, device,
-                           exclude_cols=None):
-    """Load, run inference, compute metrics, and save results for one model."""
+                           exclude_cols=None, calibrate=False):
+    """Load, run inference, compute metrics, and save results for one model.
+
+    If calibrate=True, fits a temperature scalar T on the validation set and
+    reports calibrated metrics alongside uncalibrated ones.
+    """
     exclude_cols = exclude_cols or []
     results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -224,7 +256,20 @@ def evaluate_single_model(model_name, data_dir, models_dir, results_dir, device,
             EmbeddingADRDataset(X_test, y_test),
             batch_size=1024, shuffle=False, num_workers=0,
         )
-        y_proba, y_true = run_inference_embedding(model, test_loader, device)
+        logits, y_true = run_inference_embedding(model, test_loader, device)
+
+        if calibrate:
+            X_val = pd.read_csv(data_dir / "X_val.csv")
+            y_val = pd.read_csv(data_dir / "y_val.csv")
+            if exclude_cols:
+                X_val = X_val.drop(columns=[c for c in exclude_cols if c in X_val.columns])
+            val_loader = DataLoader(
+                EmbeddingADRDataset(X_val, y_val),
+                batch_size=1024, shuffle=False, num_workers=0,
+            )
+            val_logits, val_targets = run_inference_embedding(
+                model, val_loader, device, desc="Val (calibration)"
+            )
 
     else:
         # --- MLP / ResNet / Attention ---
@@ -248,15 +293,37 @@ def evaluate_single_model(model_name, data_dir, models_dir, results_dir, device,
             ADRDataset(X_test, y_test),
             batch_size=1024, shuffle=False, num_workers=0,
         )
-        y_proba, y_true = run_inference_standard(model, test_loader, device)
+        logits, y_true = run_inference_standard(model, test_loader, device)
+
+        if calibrate:
+            X_val = pd.read_csv(data_dir / "X_val.csv")
+            y_val = pd.read_csv(data_dir / "y_val.csv")
+            if exclude_cols:
+                X_val = X_val.drop(columns=[c for c in exclude_cols if c in X_val.columns])
+            val_loader = DataLoader(
+                ADRDataset(X_val, y_val),
+                batch_size=1024, shuffle=False, num_workers=0,
+            )
+            val_logits, val_targets = run_inference_standard(
+                model, val_loader, device, desc="Val (calibration)"
+            )
+
+    # --- Temperature scaling ---
+    temperature = 1.0
+    if calibrate:
+        temperature = find_temperature(val_logits, val_targets)
+        print(f"\nTemperature scaling: T = {temperature:.4f}")
+
+    y_proba      = 1.0 / (1.0 + np.exp(-logits / temperature))
+    y_proba_raw  = 1.0 / (1.0 + np.exp(-logits))  # T=1, for comparison
 
     # --- Metrics ---
     auroc = roc_auc_score(y_true, y_proba)
     auprc = average_precision_score(y_true, y_proba)
-    fpr, tpr, _         = roc_curve(y_true, y_proba)
+    fpr, tpr, _          = roc_curve(y_true, y_proba)
     precision, recall, _ = precision_recall_curve(y_true, y_proba)
-    threshold_metrics   = calculate_metrics_at_thresholds(y_true, y_proba)
-    y_pred              = (y_proba >= 0.5).astype(int)
+    threshold_metrics    = calculate_metrics_at_thresholds(y_true, y_proba)
+    y_pred               = (y_proba >= 0.5).astype(int)
 
     # --- Print ---
     print(f"\nAUROC: {auroc:.4f}  AUPRC: {auprc:.4f}")
@@ -266,6 +333,15 @@ def evaluate_single_model(model_name, data_dir, models_dir, results_dir, device,
               f"{m['precision']:<12.4f} {m['f1']:.4f}")
     print(f"\nClassification Report (threshold=0.5):")
     print(classification_report(y_true, y_pred, target_names=["No ADR", "ADR"], digits=4))
+
+    if calibrate:
+        print(f"\n--- Uncalibrated (T=1.0) vs Calibrated (T={temperature:.4f}) at threshold=0.5 ---")
+        raw_metrics = calculate_metrics_at_thresholds(y_true, y_proba_raw, thresholds=(0.5,))
+        cal_metrics = calculate_metrics_at_thresholds(y_true, y_proba,     thresholds=(0.5,))
+        r, c = raw_metrics[0.5], cal_metrics[0.5]
+        print(f"{'':20} {'Uncalibrated':>14} {'Calibrated':>12}")
+        for key in ("sensitivity", "specificity", "precision", "f1"):
+            print(f"  {key:<18} {r[key]:>14.4f} {c[key]:>12.4f}")
 
     # --- Plots ---
     plot_roc_curve(fpr, tpr, auroc, model_name,
@@ -284,10 +360,11 @@ def evaluate_single_model(model_name, data_dir, models_dir, results_dir, device,
 
     # --- Save JSON ---
     output = {
-        "model":    model_name,
-        "dataset":  str(data_dir),
-        "auroc":    float(auroc),
-        "auprc":    float(auprc),
+        "model":       model_name,
+        "dataset":     str(data_dir),
+        "auroc":       float(auroc),
+        "auprc":       float(auprc),
+        "temperature": float(temperature),
         "threshold_metrics": {
             str(k): {kk: float(vv) for kk, vv in v.items() if kk not in ("tp","tn","fp","fn")}
             for k, v in threshold_metrics.items()
@@ -315,6 +392,8 @@ def main():
     parser.add_argument("--exclude", nargs="*", default=[],
                         metavar="COL",
                         help="Feature columns to exclude before evaluation")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Apply temperature scaling (fit on val set, report calibrated metrics)")
     args = parser.parse_args()
 
     data_dir    = DATASET_DIRS[args.dataset]
@@ -338,7 +417,7 @@ def main():
         try:
             result = evaluate_single_model(
                 model_name, data_dir, models_dir, results_dir, device,
-                exclude_cols=args.exclude,
+                exclude_cols=args.exclude, calibrate=args.calibrate,
             )
             all_results[model_name] = result
         except FileNotFoundError as e:

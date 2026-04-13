@@ -325,6 +325,12 @@ def add_cumulative_patient_features(df: pd.DataFrame) -> pd.DataFrame:
 
 data = add_cumulative_patient_features(data)
 
+# Risk score — kept for backwards compatibility with saved flat MLP checkpoint.
+data["risk_score"] = (
+    data["anchor_age"] / 100 +
+    np.log1p(data["patient_prescription_count"]) / 10
+)
+
 print(f"\nFeatures created. New shape: {data.shape}")
 
 # ============================================================================
@@ -364,6 +370,7 @@ feature_cols = [
     "drug_frequency",
     "patient_admission_count",
     "patient_prescription_count",
+    "risk_score",
 ]
 
 X = data[feature_cols].copy()
@@ -392,6 +399,7 @@ numerical_cols = [
     "drug_frequency",
     "patient_admission_count",
     "patient_prescription_count",
+    "risk_score",
 ]
 
 scaler = StandardScaler()
@@ -484,6 +492,10 @@ data_m["log_dose"] = np.log1p(data_m["dose_val_rx"].clip(lower=0))
 drug_freq_m = data_m["drug"].value_counts()
 data_m["drug_frequency"] = data_m["drug"].map(drug_freq_m)
 data_m = add_cumulative_patient_features(data_m)
+data_m["risk_score"] = (
+    data_m["anchor_age"] / 100 +
+    np.log1p(data_m["patient_prescription_count"]) / 10
+)
 label_encoders_m = {}
 for col in categorical_cols:
     le_m = LabelEncoder()
