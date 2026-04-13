@@ -17,3 +17,9 @@ torch==2.4.1
 # Dashboard
 streamlit==1.40.0
 plotly==5.24.1
+
+# Calibration
+scipy>=1.11.0
+
+# Testing
+pytest>=8.0.0
