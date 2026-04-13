@@ -170,6 +170,12 @@ python src/evaluate.py
 
    - Open `notebooks/05_model_evaluation.ipynb`
    - Run all cells to compare baseline and deep learning model metrics
+  
+8. Accessing the dashboard:
+
+```bash
+streamlit app.py
+```
 
 ## Assumptions and Limitations
 
